@@ -1,0 +1,13 @@
+# case	platform	design	period_ps
+# period_ps = default clock period (placement inputs/<case>/T<period_ps>).
+# Design-specific CTS settings live in orfs/designs/<platform>/<design>/config_bottom_cover.mk.
+a7a7_aes	asap7_3D	aes	275
+a7a7_jpeg	asap7_3D	jpeg	550
+a7a7_ibex	asap7_3D	ibex	750
+a7a7_swerv	asap7_3D	swerv_wrapper	1200
+a7a7_ariane	asap7_3D	ariane133	750
+a7n45_aes	asap7_nangate45_3D	aes	300
+a7n45_jpeg	asap7_nangate45_3D	jpeg	450
+a7n45_ibex	asap7_nangate45_3D	ibex	1600
+a7n45_swerv	asap7_nangate45_3D	swerv_wrapper	1500
+a7n45_ariane	asap7_nangate45_3D	ariane133	2250

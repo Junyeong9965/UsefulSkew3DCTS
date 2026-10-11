@@ -1,0 +1,14 @@
+# site configuration (copy of setup_env.example.sh)
+setup_env.sh
+# run outputs
+runs/
+# built helpers
+flow/native/bin/
+# timing files written into the flow home by OpenROAD sessions
+orfs/.timing_file_*
+__pycache__/
+*.pyc
+*.local.*
+THIRD_PARTY_NOTICES.md
+# report written into the flow home by an OpenROAD session
+orfs/power.rpt
