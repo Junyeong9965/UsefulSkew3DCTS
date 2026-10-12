@@ -1,6 +1,9 @@
 # Stage G, one extraction process: sequential timing graph (FF->FF checks) and IO edges (PI->FF, FF->PO) of the
 # Phase-1 reference state, propagated clocks, placement parasitics.  EXTRACT_PARTITION=k/K selects the launches of
-# this process (the partitions are merged by flow/cts/native cts_partitions into the single-process row order).
+# this process (the partitions are merged by flow/cts/native cts_partitions into the single-process row order); with
+# EXTRACT_QUEUE=<counter file> the K processes take chunks of launches from that shared counter (the input-port side
+# of the IO pass is one more work item, computed by the extract_ff_timing_graph_odb call of the process that takes it
+# and written by its extract_io_timing_edges_odb call).
 # EXTRACT_WRITE_METRICS=1 (last partition): also write reports/metrics.csv (reload check of stage D).
 source $::env(FLOW_HOME)/common/read_liberty.tcl
 read_db $::env(PROBE_INPUT_ODB)

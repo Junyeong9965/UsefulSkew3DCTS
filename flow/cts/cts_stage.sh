@@ -8,9 +8,10 @@
 # Stages
 #   P   Phase 1: balanced 3D tree on the placed design + propagated-clock reference state (phase1.odb/sdc/metrics,
 #       leaf bounds, base latency, leaf groups)
-#   G   sequential-graph extraction: K processes x 1 thread over a deterministic launch partition (partition 0 has
-#       weight 50 %, TimingGraphExtractor.cpp), integrity check, merge into the single-process row order; one process
-#       over all launches if the check fails.  BLOCKED native admission (latch / gated-clock checks) marks the arm as
+#   G   sequential-graph extraction: K processes x 1 thread that take chunks of launches (and, as item 0, the
+#       input-port side) from one shared work counter, so a process that finishes early takes more work; integrity
+#       check, merge into the single-process row order (identical files for every K); one process over all launches
+#       if the check fails.  BLOCKED native admission (latch / gated-clock checks) marks the arm as
 #       STA-guarded.
 #   GB  STA-guarded arms only: guard endpoints + baseline guard STA on phase1 + guard manifest
 #   D   LP + delivery tree + repair + legalization (12 threads); LP target check in the background
@@ -54,7 +55,7 @@ extract_proc() {  # <k|single> <workdir> <threads>
   local k=$1 work=$2 th=$3
   (
     if [[ $k == single ]]; then export EXTRACT_PARTITION=0/1 EXTRACT_WRITE_METRICS=1
-    else export EXTRACT_PARTITION=$k/$K; [[ $k -ne $((K-1)) ]] || export EXTRACT_WRITE_METRICS=1; fi
+    else export EXTRACT_PARTITION=$k/$K EXTRACT_QUEUE=$gq; [[ $k -ne $((K-1)) ]] || export EXTRACT_WRITE_METRICS=1; fi
     OPENROAD_RUN_KEEP=1 bash "$CTS_DIR/openroad_run.sh" "$work" "$platform" "$design" "$odb" "$sdc" "$CTS_DIR/tcl/extract_graph.tcl" "$th"
     echo $? > "$work/RC"
   ) > "$work/run.out" 2>&1
@@ -64,13 +65,18 @@ stage_G() {
   rm -rf "$G"; mkdir -p "$G/parts" "$G/reports"
   odb=$(readlink -f "$P/phase1.odb"); sdc=$(readlink -f "$P/phase1.sdc")
   sha256sum "$CTS3D_OPENROAD" "$odb" "$sdc" "$CTS_DIR/tcl/extract_graph.tcl" > "$G/INPUTS.sha256"
-  { echo "run=$(date +%s%N).$$ host=$(hostname -s) K=$K threads=1"; cat "$G/INPUTS.sha256"; } > "$G/RUN_TOKEN"
+  # work counter of the K processes: one file on node-local storage (all K processes run on this host; the claims
+  # use fcntl locks); removed after the processes have finished
+  local gq
+  gq=$(mktemp -p /dev/shm cts3d_gq.XXXXXX 2>/dev/null || mktemp -p "${TMPDIR:-/tmp}" cts3d_gq.XXXXXX) || return 1
+  { echo "run=$(date +%s%N).$$ host=$(hostname -s) K=$K threads=1 mode=queue"; cat "$G/INPUTS.sha256"; } > "$G/RUN_TOKEN"
   local pids=() k ok=1
   for ((k = 0; k < K; k++)); do
     mkdir -p "$G/parts/p$k"; { cat "$G/RUN_TOKEN"; echo "partition=$k/$K"; } > "$G/parts/p$k/RUN_TOKEN"
     extract_proc $k "$G/parts/p$k" 1 & pids+=($!)
   done
   for pid in "${pids[@]}"; do wait "$pid"; done
+  rm -f "$gq"
   "$NATIVE/cts_partitions" check "$G" $K "$G/RUN_TOKEN" > "$G/parts_check.log" 2>&1 || ok=0
   if [[ $ok == 1 ]]; then
     "$NATIVE/cts_partitions" merge "$G/parts" $K "$G/results" > "$G/merge.log" 2>&1 || ok=0

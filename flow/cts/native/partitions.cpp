@@ -8,12 +8,17 @@
 //                FF->FF rows, then one identity row per launch in the same order.
 //   FF events  : header, then each launch's event bytes in single-process order.
 //   FF status  : retained / unsupported / inactive_source_modes = sums over partitions; BLOCKED iff unsupported != 0.
-//   IO events  : header, PI-side events (partition 0), then each launch's FF->PO events in single-process order.
+//   IO events  : header, PI-side events (partition 0, or in queue mode the partition whose IO index says pi=1), then
+//                each launch's FF->PO events in single-process order.
 //   IO edges   : the single-process file is the iteration order of an unordered_map whose keys were inserted PI side
 //                first, then per launch in single-process order.  The same key insertion sequence into a
 //                std::unordered_map<std::string, int> (libstdc++ of the openroad binary, gcc 12) gives the same
 //                iteration order, so this tool must be built with that compiler.
 //   IO status  : retained / unsupported = sums; BLOCKED iff unsupported is non-zero.
+// Static mode (EXTRACT_PARTITION only): partition k ran a fixed subset of the launches.  Queue mode (index headers
+// with queue=1): the processes took chunks of launches from one shared counter, so any process may hold any launch
+// and exactly one process ran the input-port side (pi=1); all partitions must agree on the mode and the chunk size.
+// The merge itself is the same in both modes because it orders by the single-process launch order of every launch.
 // Every structural assumption is checked; any violation aborts with exit status 3.
 #include <chrono>
 #include <cstdio>
@@ -118,12 +123,20 @@ long long merge_ff(const std::vector<std::string>& parts, const std::string& out
   long long total_sources = -1;
   sums = {{"retained", 0}, {"unsupported", 0}, {"inactive_source_modes", 0}};
   std::set<std::string> headers, ev_headers;
+  std::set<std::string> modes;  // "static" or "queue chunk=<S> items=<n>" per partition; must be one value
+  int pi_owners = 0;
   for (size_t k = 0; k < parts.size(); ++k) {
     const std::string& rdir = parts[k];
     auto idx = split(read_text(path_of(rdir, "ff_partition_index.csv")), '\n');
     auto meta = meta_of(idx.at(0));
     std::string want = std::to_string(k) + "/" + std::to_string(parts.size());
     if (meta["partition"] != want) die("ff index of p" + std::to_string(k) + " says partition " + meta["partition"]);
+    if (meta["queue"] == "1") {
+      modes.insert("queue chunk=" + meta["chunk"] + " items=" + meta["items"]);
+      if (meta["pi"] == "1") ++pi_owners;
+    } else {
+      modes.insert("static");
+    }
     if (total_sources < 0) total_sources = to_int(meta["total_sources"]);
     else if (total_sources != to_int(meta["total_sources"])) die("partitions disagree on the launch universe size");
     std::vector<std::vector<std::string>> rows;
@@ -178,6 +191,8 @@ long long merge_ff(const std::vector<std::string>& parts, const std::string& out
     datas.emplace_back(std::move(csv), std::move(ev));
   }
   if (headers.size() != 1 || ev_headers.size() != 1) die("FF headers differ between partitions");
+  if (modes.size() != 1) die("partitions disagree on the launch distribution mode / chunk size");
+  if (*modes.begin() != "static" && pi_owners != 1) die("queue mode: " + std::to_string(pi_owners) + " partitions ran the input-port side");
   if ((long long) blocks.size() != total_sources) die("launch coverage: " + std::to_string(blocks.size()) + " of " + std::to_string(total_sources) + " launches present");
   for (long long o = 0; o < total_sources; ++o) if (!blocks.count(o)) die("launch coverage: order " + std::to_string(o) + " missing");
   {
@@ -210,10 +225,24 @@ std::vector<long long> merge_io(const std::vector<std::string>& parts, const std
   std::unordered_map<std::string, int> key_owner;
   std::vector<long long> counters(8, 0);
   std::set<std::string> headers, ev_headers;
+  int pi_owner = -1;
+  std::set<bool> queue_modes;
   for (size_t k = 0; k < parts.size(); ++k) {
     const std::string& rdir = parts[k];
     auto idx = split(read_text(path_of(rdir, "io_partition_index.csv")), '\n');
-    if (idx.at(0) != "#partition=" + std::to_string(k) + "/" + std::to_string(parts.size())) die("io index of p" + std::to_string(k) + " says " + idx[0]);
+    auto meta = meta_of(idx.at(0));
+    if (meta["partition"] != std::to_string(k) + "/" + std::to_string(parts.size())) die("io index of p" + std::to_string(k) + " says " + idx[0]);
+    // static header: exactly "#partition=k/K" (partition 0 owns the input-port side);
+    // queue header: "#partition=k/K queue=1 pi=<0|1>"
+    const bool queued = meta["queue"] == "1";
+    if (!queued && idx[0] != "#partition=" + std::to_string(k) + "/" + std::to_string(parts.size())) die("io index of p" + std::to_string(k) + " says " + idx[0]);
+    if (queued && meta["pi"] != "0" && meta["pi"] != "1") die("io index of p" + std::to_string(k) + " has no pi flag");
+    queue_modes.insert(queued);
+    const bool owns_pi = queued ? meta["pi"] == "1" : k == 0;
+    if (owns_pi) {
+      if (pi_owner >= 0) die("two partitions ran the input-port side");
+      pi_owner = (int) k;
+    }
     struct S { long long order; size_t audit_end, keys_end; std::string name; };
     std::vector<S> segs;
     std::vector<std::string> keys;
@@ -246,8 +275,8 @@ std::vector<long long> merge_io(const std::vector<std::string>& parts, const std
       part.keys.assign(keys.begin() + prev_key, keys.begin() + s.keys_end);
       prev_ev = s.audit_end; prev_key = s.keys_end;
       if (s.order == -1) {
-        if (k == 0) { pi = part; have_pi = true; }
-        else if (!part.ev.empty() || !part.keys.empty()) die("p" + std::to_string(k) + " has PI-side output but is not partition 0");
+        if ((int) k == pi_owner) { pi = part; have_pi = true; }
+        else if (!part.ev.empty() || !part.keys.empty()) die("p" + std::to_string(k) + " has PI-side output but did not run the input-port side");
       } else {
         if (seg.count(s.order)) die("io: launch order " + std::to_string(s.order) + " appears twice");
         seg[s.order] = part;
@@ -275,6 +304,7 @@ std::vector<long long> merge_io(const std::vector<std::string>& parts, const std
     if (n_rows != keys.size()) die("p" + std::to_string(k) + ": IO rows and keys differ in number");
   }
   if (headers.size() != 1 || ev_headers.size() != 1) die("IO headers differ between partitions");
+  if (queue_modes.size() != 1) die("IO indexes disagree on the launch distribution mode");
   if ((long long) seg.size() != total_sources) die("io launch coverage: " + std::to_string(seg.size()) + " of " + std::to_string(total_sources));
   for (long long o = 0; o < total_sources; ++o) if (!seg.count(o)) die("io launch coverage: order " + std::to_string(o) + " missing");
   if (!have_pi) die("no PI segment");

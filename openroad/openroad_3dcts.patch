@@ -11002,10 +11002,10 @@ index c5594391e4..70e10a11c0 100644
    std::vector<std::string> masterNames_;
 diff --git a/src/cts/src/TimingGraphExtractor.cpp b/src/cts/src/TimingGraphExtractor.cpp
 new file mode 100644
-index 0000000000..b7353993f3
+index 0000000000..efa9a75783
 --- /dev/null
 +++ b/src/cts/src/TimingGraphExtractor.cpp
-@@ -0,0 +1,1505 @@
+@@ -0,0 +1,1870 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2019-2025, The OpenROAD Authors
 +
@@ -11020,6 +11020,11 @@ index 0000000000..b7353993f3
 +#include <cstring>
 +#include <fstream>
 +#include <limits>
++#include <sstream>
++
++#include <cerrno>
++#include <fcntl.h>
++#include <unistd.h>
 +
 +#include "Cts3DDatabase.h"
 +#include "db_sta/dbNetwork.hh"
@@ -11195,6 +11200,12 @@ index 0000000000..b7353993f3
 +  std::vector<LaunchMember> members;
 +  const unsigned long long w = static_cast<unsigned long long>(kPartition0Weight);
 +  const unsigned long long m = 100ULL * (part.total - 1) + w;
++  // EXTRACT_PARTITION_BLOCKS=1: same launch count per partition as below, but
++  // each partition takes one contiguous range of the name order (partition 0
++  // first), so consecutive launches of a process are name neighbours.
++  const char* blocks_env = std::getenv("EXTRACT_PARTITION_BLOCKS");
++  const bool blocks = blocks_env && std::atoi(blocks_env) == 1;
++  std::vector<size_t> count(part.total, 0);
 +  for (size_t rank = 0; rank < all.size(); ++rank) {
 +    // Number of partition-0 launches among ranks [0, rank) and [0, rank].
 +    const unsigned long long before = rank * w / m;
@@ -11203,11 +11214,167 @@ index 0000000000..b7353993f3
 +        = (after > before)
 +              ? 0
 +              : 1 + static_cast<int>((rank - before) % (part.total - 1));
-+    if (owner == part.id) {
++    ++count[owner];
++    if (!blocks && owner == part.id) {
++      members.push_back(std::move(all[rank]));
++    }
++  }
++  if (blocks) {
++    size_t first = 0;
++    for (int k = 0; k < part.id; ++k) {
++      first += count[k];
++    }
++    for (size_t rank = first; rank < first + count[part.id]; ++rank) {
 +      members.push_back(std::move(all[rank]));
 +    }
 +  }
 +  return members;
++}
++
++// ----------------------------------------------------------------------------
++// Dynamic launch distribution, EXTRACT_QUEUE=<counter file> together with
++// EXTRACT_PARTITION=k/N (N > 1).  Instead of the static rank partition above,
++// the N processes of a run take work items from one shared counter: item 0 is
++// the input-port side of the IO pass (computed in the register pass of the
++// process that claims it and replayed by its IO pass), items 1..C are chunks of
++// S consecutive launches in name order.  A process that finishes early simply
++// takes more items.  Every launch is still queried by itself (one findPathEnds
++// per launch, as in the static mode), and the per-launch index files carry the
++// single-process order of every launch, so the merge step reassembles the same
++// files byte for byte whatever process ran which launch.
++// The counter file holds the next unclaimed item as decimal text; a claim reads
++// and advances it under an exclusive fcntl lock (all processes of a run are
++// started by stage G on one host).
++// ----------------------------------------------------------------------------
++std::string queuePath()
++{
++  const char* s = std::getenv("EXTRACT_QUEUE");
++  return s ? std::string(s) : std::string();
++}
++
++// Chunk size S: EXTRACT_QUEUE_CHUNK when set (> 0), else
++// ceil(launches / (64 N)) clamped to [1, 16], i.e. about 64 chunks per process
++// and at most 16 launches (about 10 s on the largest design) per chunk.  Every
++// process computes the same value from the same universe and N.
++int queueChunk(int n_launches, int n_procs)
++{
++  if (const char* s = std::getenv("EXTRACT_QUEUE_CHUNK")) {
++    const int v = std::atoi(s);
++    if (v > 0) {
++      return v;
++    }
++  }
++  const long per = 64L * std::max(1, n_procs);
++  const long c = (static_cast<long>(n_launches) + per - 1) / per;
++  return static_cast<int>(std::min(16L, std::max(1L, c)));
++}
++
++// Chunk boundaries (start of every chunk, then n_launches).  Chunks hold S
++// launches; with the taper (default, EXTRACT_QUEUE_TAPER=0 disables it) the
++// size shrinks to ceil(remaining / (4 N)) once that is below S, down to one
++// launch, so that the last items are short and the processes finish together.
++// Depends only on (n_launches, N, S): every process computes the same list.
++std::vector<long> queueChunkStarts(int n_launches, int n_procs, int chunk)
++{
++  const char* t = std::getenv("EXTRACT_QUEUE_TAPER");
++  const bool taper = !(t && std::atoi(t) == 0);
++  const long per = 4L * std::max(1, n_procs);
++  std::vector<long> starts;
++  long pos = 0;
++  while (pos < n_launches) {
++    starts.push_back(pos);
++    long size = chunk;
++    if (taper) {
++      size = std::min<long>(chunk, std::max(1L, (n_launches - pos + per - 1) / per));
++    }
++    pos = std::min<long>(n_launches, pos + size);
++  }
++  starts.push_back(n_launches);
++  return starts;
++}
++
++// Claims the next work item: returns it, or -1 when all n_items are taken.
++// Returns -2 on an I/O or locking error.
++long claimQueueItem(int fd, long n_items)
++{
++  struct flock fl;
++  std::memset(&fl, 0, sizeof(fl));
++  fl.l_type = F_WRLCK;
++  fl.l_whence = SEEK_SET;
++  fl.l_start = 0;
++  fl.l_len = 0;  // whole file
++  while (fcntl(fd, F_SETLKW, &fl) == -1) {
++    if (errno != EINTR) {
++      return -2;
++    }
++  }
++  char buf[32];
++  std::memset(buf, 0, sizeof(buf));
++  const ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
++  long next = 0;
++  bool ok = n >= 0;
++  if (ok && n > 0) {
++    next = std::strtol(buf, nullptr, 10);
++  }
++  long item = -1;
++  if (ok && next < n_items) {
++    item = next;
++    // fixed width, so a shorter number never leaves stale digits behind
++    std::snprintf(buf, sizeof(buf), "%20ld\n", next + 1);
++    ok = pwrite(fd, buf, 21, 0) == 21;
++  }
++  fl.l_type = F_UNLCK;
++  fcntl(fd, F_SETLK, &fl);
++  return ok ? item : -2;
++}
++
++// Input-port side of the IO pass (input port -> register edges) as plain
++// values: edges in first-insert order of their keys, the "unsupported" audit
++// lines, and the counters.  Computed by computeInputPortSide; applied to the
++// IO pass state in key order, which reproduces the edge-map insertion sequence
++// of the direct computation.
++struct PiSideResult
++{
++  std::vector<std::string> keys;  // "PI_TO_FF|port|ff", first-insert order
++  std::vector<IOEdge> edges;      // final edge per key (same order)
++  std::string audit;              // io_admission_events.csv lines
++  size_t retained = 0;
++  size_t unsupported = 0;
++  int setup_ct = 0, hold_ct = 0, removal_ct = 0, recovery_ct = 0;
++};
++
++// Data input ports (clock ports are skipped), in block order.
++std::vector<odb::dbBTerm*> dataInputPorts(odb::dbBlock* block)
++{
++  std::vector<odb::dbBTerm*> ports;
++  for (auto* bterm : block->getBTerms()) {
++    if (bterm->getSigType() == odb::dbSigType::CLOCK) {
++      continue;
++    }
++    if (bterm->getIoType() == odb::dbIoType::INPUT) {
++      ports.push_back(bterm);
++    }
++  }
++  return ports;
++}
++
++// Register-pass state handed to the IO pass of the same process in queue mode:
++// the launches this process claimed (processing order) and, when it claimed
++// item 0, the input-port side.
++struct QueueState
++{
++  bool valid = false;
++  odb::dbBlock* block = nullptr;
++  float fingerprint[4] = {0, 0, 0, 0};
++  std::vector<LaunchMember> claimed;
++  bool pi_owner = false;
++  PiSideResult pi;
++};
++
++QueueState& queueState()
++{
++  static QueueState state;
++  return state;
 +}
 +
 +// Plain-value image of one register -> output-port PathEnd.  PathEnds are
@@ -11286,6 +11453,187 @@ index 0000000000..b7353993f3
 +  }
 +  r.slack_ns = sta::delayAsFloat(pe->slack(sta)) * SEC_TO_NS;
 +  return r;
++}
++
++// Input port -> register side of the IO extraction: one fused query per data
++// input port, ends split by path group and consumed in the order setup, hold,
++// removal, recovery.  The IO pass calls this function in both modes; the
++// results are kept as plain values (PiSideResult) so that the register pass of
++// a queue-mode process can compute them early.
++PiSideResult computeInputPortSide(
++    sta::dbSta* sta,
++    sta::dbNetwork* network,
++    odb::dbBlock* block,
++    int endpoint_limit,
++    std::unordered_map<const sta::Instance*, bool>& latch_cache,
++    const std::unordered_map<odb::dbInst*, std::string>& inst_to_name,
++    const std::unordered_map<std::string, std::string>& ff_clock_cache,
++    utl::Logger* logger)
++{
++  constexpr float SEC_TO_NS = 1e9f;
++  PiSideResult res;
++  std::unordered_map<std::string, size_t> key_index;
++  std::ostringstream audit;
++  auto accepted = [&](sta::PathEnd* pe) {
++    auto why = admissionReason(pe, sta, network, latch_cache);
++    if (!why.empty()) {
++      ++res.unsupported;
++      audit << "unsupported," << why << ","
++            << (pe && pe->path() ? network->pathName(pe->path()->pin(sta))
++                                 : "NULL")
++            << "\n";
++      return false;
++    }
++    ++res.retained;
++    return true;
++  };
++  // Launch register name of an end pin (instance name for a non-register).
++  auto getFFName = [&](sta::Pin* pin) -> std::string {
++    if (!pin) {
++      return "";
++    }
++    sta::Instance* inst = network->instance(pin);
++    if (!inst) {
++      return "";
++    }
++    odb::dbInst* odb_inst = network->staToDb(inst);
++    if (!odb_inst) {
++      return "";
++    }
++    auto it = inst_to_name.find(odb_inst);
++    if (it != inst_to_name.end()) {
++      return it->second;
++    }
++    return odb_inst->getName();
++  };
++  auto piQuery = [&](sta::Pin* port_pin) {
++    sta::PinSet* from_pins = new sta::PinSet(network);
++    from_pins->insert(port_pin);
++    sta::ExceptionFrom* from = sta->makeExceptionFrom(
++        from_pins, nullptr, nullptr, sta::RiseFallBoth::riseFall());
++    return sta->findPathEnds(from,
++                             nullptr,
++                             nullptr,
++                             false,
++                             nullptr,
++                             sta::MinMaxAll::all(),
++                             endpoint_limit,
++                             1,
++                             true,
++                             false,
++                             -sta::INF,
++                             sta::INF,
++                             false,
++                             nullptr,
++                             true,
++                             true,
++                             true,
++                             true,
++                             false,
++                             false);
++  };
++  // kind: 0 = setup, 1 = hold, 2 = removal, 3 = recovery.
++  auto piApply = [&](const std::string& port_name,
++                     const sta::PathEndSeq& path_ends,
++                     int kind) {
++    const bool is_max = (kind == 0 || kind == 3);
++    if (path_ends.size() >= static_cast<size_t>(endpoint_limit)) {
++      logger->error(utl::CTS, 971, "IO extraction: endpoint bound saturated");
++    }
++    for (sta::PathEnd* pe : path_ends) {
++      if (!accepted(pe)) {
++        continue;
++      }
++      if (!pe) {
++        continue;
++      }
++      sta::Pin* end_pin = nullptr;
++      if (is_max) {
++        const sta::Path* path = pe->path();
++        if (!path) {
++          continue;
++        }
++        end_pin = path->pin(sta);
++      } else {
++        sta::Vertex* end_vertex = pe->vertex(sta);
++        if (!end_vertex) {
++          continue;
++        }
++        end_pin = end_vertex->pin();
++      }
++      std::string ff = getFFName(end_pin);
++      if (ff.empty()) {
++        continue;
++      }
++
++      std::string key = "PI_TO_FF|" + port_name + "|" + ff;
++      auto ki = key_index.find(key);
++      if (ki == key_index.end()) {
++        ki = key_index.emplace(key, res.keys.size()).first;
++        res.keys.push_back(key);
++        res.edges.emplace_back();
++      }
++      IOEdge& e = res.edges[ki->second];
++      e.edge_type = "PI_TO_FF";
++      e.port_name = port_name;
++      e.ff_name = ff;
++      auto ck = ff_clock_cache.find(ff);
++      e.ff_clock_net = ck != ff_clock_cache.end() ? ck->second : "";
++      float slack = sta::delayAsFloat(pe->slack(sta)) * SEC_TO_NS;
++      if (is_max) {
++        if (!e.has_setup || slack < e.slack_setup_ns) {
++          e.slack_setup_ns = slack;
++          e.has_setup = true;
++          if (kind == 0) {
++            res.setup_ct++;
++          } else {
++            res.recovery_ct++;
++          }
++        }
++      } else {
++        // Removal (asynchronous hold) is merged into the hold slack.
++        if (!e.has_hold || slack < e.slack_hold_ns) {
++          e.slack_hold_ns = slack;
++          e.has_hold = true;
++          if (kind == 1) {
++            res.hold_ct++;
++          } else {
++            res.removal_ct++;
++          }
++        }
++      }
++    }
++  };
++
++  for (auto* bterm : dataInputPorts(block)) {
++    std::string port_name = bterm->getName();
++    sta::Pin* port_pin = network->dbToSta(bterm);
++    if (!port_pin) {
++      continue;
++    }
++    // Fused query: PathGroups builds the max groups from (setup, recovery)
++    // and the min groups from (hold, removal), so one call with all four
++    // flags returns the union of the four separate calls (clock/named groups
++    // <- setup|hold, "asynchronous" group <- recovery|removal); the group
++    // path count is a per-group bound.  Split by group, then emit in the
++    // separate-query order.
++    sta::PathEndSeq all_ends = piQuery(port_pin);
++    sta::PathEndSeq split[4];
++    for (sta::PathEnd* pe : all_ends) {
++      const bool is_min = pe && pe->minMax(sta) == sta::MinMax::min();
++      const bool is_async
++          = pe && pe->pathGroup()
++            && std::strcmp(pe->pathGroup()->name(),
++                           sta::PathGroups::asyncPathGroupName())
++                   == 0;
++      split[is_min ? (is_async ? 2 : 1) : (is_async ? 3 : 0)].push_back(pe);
++    }
++    for (int kind = 0; kind < 4; ++kind) {
++      piApply(port_name, split[kind], kind);
++    }
++  }
++  res.audit = audit.str();
++  return res;
 +}
 +
 +}  // namespace
@@ -11378,21 +11726,6 @@ index 0000000000..b7353993f3
 +    std::string name;
 +  };
 +  std::vector<IoSegment> part_segs;
-+  auto accepted = [&](sta::PathEnd* pe) {
-+    auto why = admissionReason(pe, sta_, network_, latch_cache);
-+    if (!why.empty()) {
-+      ++unsupported;
-+      audit << "unsupported," << why << ","
-+            << (pe && pe->path() ? network_->pathName(pe->path()->pin(sta_))
-+                                 : "NULL")
-+            << "\n";
-+      return false;
-+    }
-+    ++retained;
-+    return true;
-+  };
-+  constexpr float SEC_TO_NS = 1e9f;
-+
 +  std::unordered_map<odb::dbInst*, std::string> inst_to_name;
 +  for (const auto& [name, inst] : odb_registers_) {
 +    inst_to_name[inst] = name;
@@ -11422,24 +11755,6 @@ index 0000000000..b7353993f3
 +  // key "type|port|ff" -> edge (worst slack per pair and corner)
 +  std::unordered_map<std::string, IOEdge> edge_map;
 +
-+  auto getFFName = [&](sta::Pin* pin) -> std::string {
-+    if (!pin) {
-+      return "";
-+    }
-+    sta::Instance* inst = network_->instance(pin);
-+    if (!inst) {
-+      return "";
-+    }
-+    odb::dbInst* odb_inst = network_->staToDb(inst);
-+    if (!odb_inst) {
-+      return "";
-+    }
-+    auto it = inst_to_name.find(odb_inst);
-+    if (it != inst_to_name.end()) {
-+      return it->second;
-+    }
-+    return odb_inst->getName();
-+  };
 +
 +  std::unordered_map<std::string, std::string> io_ff_clock_cache;
 +  for (const auto& [name, inst] : odb_registers_) {
@@ -11451,140 +11766,52 @@ index 0000000000..b7353993f3
 +  int po_setup_ends = 0, po_ff_empty = 0;
 +
 +  // ==================== input port -> register ====================
-+  auto piQuery = [&](sta::Pin* port_pin,
-+                     const sta::MinMaxAll* mm,
-+                     bool setup,
-+                     bool hold,
-+                     bool recovery,
-+                     bool removal) {
-+    sta::PinSet* from_pins = new sta::PinSet(network_);
-+    from_pins->insert(port_pin);
-+    sta::ExceptionFrom* from = sta_->makeExceptionFrom(
-+        from_pins, nullptr, nullptr, sta::RiseFallBoth::riseFall());
-+    return sta_->findPathEnds(from,
-+                              nullptr,
-+                              nullptr,
-+                              false,
-+                              nullptr,
-+                              mm,
-+                              endpoint_limit,
-+                              1,
-+                              true,
-+                              false,
-+                              -sta::INF,
-+                              sta::INF,
-+                              false,
-+                              nullptr,
-+                              setup,
-+                              hold,
-+                              recovery,
-+                              removal,
-+                              false,
-+                              false);
-+  };
-+  // kind: 0 = setup, 1 = hold, 2 = removal, 3 = recovery.
-+  auto piApply = [&](const std::string& port_name,
-+                     const sta::PathEndSeq& path_ends,
-+                     int kind) {
-+    const bool is_max = (kind == 0 || kind == 3);
-+    if (path_ends.size() >= static_cast<size_t>(endpoint_limit)) {
-+      logger_->error(utl::CTS, 971, "IO extraction: endpoint bound saturated");
++  // Static mode: partition 0 (or the single process) runs the input-port
++  // side here.  Queue mode: the process that claimed work item 0 computed it in
++  // its register pass; it is replayed when the timing state is unchanged
++  // (re-computed otherwise; same queries, same result).
++  const bool queued = parted && !queuePath().empty();
++  QueueState& qstate = queueState();
++  if (queued && (!qstate.valid || qstate.block != block_)) {
++    logger_->error(utl::CTS,
++                   2138,
++                   "IO extraction (queue mode): no register pass of this "
++                   "process on this block");
++  }
++  const bool run_pi = queued ? qstate.pi_owner : (!parted || part.id == 0);
++  if (run_pi) {
++    bool replay = false;
++    if (queued) {
++      float fp[4];
++      timingFingerprint(sta_, fp);
++      replay = std::memcmp(fp, qstate.fingerprint, sizeof(fp)) == 0;
 +    }
-+    for (sta::PathEnd* pe : path_ends) {
-+      if (!accepted(pe)) {
-+        continue;
-+      }
-+      if (!pe) {
-+        continue;
-+      }
-+      sta::Pin* end_pin = nullptr;
-+      if (is_max) {
-+        const sta::Path* path = pe->path();
-+        if (!path) {
-+          continue;
-+        }
-+        end_pin = path->pin(sta_);
-+      } else {
-+        sta::Vertex* end_vertex = pe->vertex(sta_);
-+        if (!end_vertex) {
-+          continue;
-+        }
-+        end_pin = end_vertex->pin();
-+      }
-+      std::string ff = getFFName(end_pin);
-+      if (ff.empty()) {
-+        continue;
-+      }
-+
-+      std::string key = "PI_TO_FF|" + port_name + "|" + ff;
-+      if (parted && !edge_map.count(key)) {
-+        part_keys.push_back(key);
-+      }
-+      auto& e = edge_map[key];
-+      e.edge_type = "PI_TO_FF";
-+      e.port_name = port_name;
-+      e.ff_name = ff;
-+      e.ff_clock_net
-+          = io_ff_clock_cache.count(ff) ? io_ff_clock_cache[ff] : "";
-+      float slack = sta::delayAsFloat(pe->slack(sta_)) * SEC_TO_NS;
-+      if (is_max) {
-+        if (!e.has_setup || slack < e.slack_setup_ns) {
-+          e.slack_setup_ns = slack;
-+          e.has_setup = true;
-+          if (kind == 0) {
-+            pi_setup_ct++;
-+          } else {
-+            pi_recovery_ct++;
-+          }
-+        }
-+      } else {
-+        // Removal (asynchronous hold) is merged into the hold slack.
-+        if (!e.has_hold || slack < e.slack_hold_ns) {
-+          e.slack_hold_ns = slack;
-+          e.has_hold = true;
-+          if (kind == 1) {
-+            pi_hold_ct++;
-+          } else {
-+            pi_removal_ct++;
-+          }
-+        }
-+      }
++    PiSideResult computed;
++    if (!replay) {
++      computed = computeInputPortSide(sta_,
++                                      network_,
++                                      block_,
++                                      endpoint_limit,
++                                      latch_cache,
++                                      inst_to_name,
++                                      io_ff_clock_cache,
++                                      logger_);
 +    }
-+  };
-+
-+  for (auto* bterm : input_ports) {
-+    // The input-port side is not per launch: only partition 0 runs it.
-+    if (parted && part.id != 0) {
-+      break;
++    const PiSideResult& pi = replay ? qstate.pi : computed;
++    // Same edge-map insertion sequence as the direct computation.
++    for (size_t i = 0; i < pi.keys.size(); ++i) {
++      if (parted) {
++        part_keys.push_back(pi.keys[i]);
++      }
++      edge_map[pi.keys[i]] = pi.edges[i];
 +    }
-+    std::string port_name = bterm->getName();
-+    sta::Pin* port_pin = network_->dbToSta(bterm);
-+    if (!port_pin) {
-+      continue;
-+    }
-+
-+    // Fused query: PathGroups builds the max groups from (setup, recovery)
-+    // and the min groups from (hold, removal), so one call with all four
-+    // flags returns the union of the four separate calls (clock/named groups
-+    // <- setup|hold, "asynchronous" group <- recovery|removal); the group
-+    // path count is a per-group bound.  Split by group, then emit in the
-+    // separate-query order.
-+    sta::PathEndSeq all_ends = piQuery(
-+        port_pin, sta::MinMaxAll::all(), true, true, true, true);
-+    sta::PathEndSeq split[4];
-+    for (sta::PathEnd* pe : all_ends) {
-+      const bool is_min = pe && pe->minMax(sta_) == sta::MinMax::min();
-+      const bool is_async
-+          = pe && pe->pathGroup()
-+            && std::strcmp(pe->pathGroup()->name(),
-+                           sta::PathGroups::asyncPathGroupName())
-+                   == 0;
-+      split[is_min ? (is_async ? 2 : 1) : (is_async ? 3 : 0)].push_back(pe);
-+    }
-+    for (int kind = 0; kind < 4; ++kind) {
-+      piApply(port_name, split[kind], kind);
-+    }
-+
++    audit << pi.audit;
++    retained += pi.retained;
++    unsupported += pi.unsupported;
++    pi_setup_ct += pi.setup_ct;
++    pi_hold_ct += pi.hold_ct;
++    pi_removal_ct += pi.removal_ct;
++    pi_recovery_ct += pi.recovery_ct;
 +  }
 +
 +  if (parted) {
@@ -11712,10 +11939,13 @@ index 0000000000..b7353993f3
 +    }
 +  }
 +
-+  // Launches of this process: every register in odb_registers_ order, or the
-+  // members of this partition only.
++  // Launches of this process: every register in odb_registers_ order, the
++  // members of this partition only (static mode), or the launches this
++  // process claimed in its register pass (queue mode, claim order).
 +  std::vector<LaunchMember> po_sources;
-+  if (parted) {
++  if (queued) {
++    po_sources = qstate.claimed;
++  } else if (parted) {
 +    po_sources = partitionMembers(odb_registers_, network_, part, nullptr);
 +  } else {
 +    po_sources.reserve(odb_registers_.size());
@@ -11769,6 +11999,10 @@ index 0000000000..b7353993f3
 +    }
 +  }
 +  po_cache = PoCache();  // one-shot: a stash is never replayed twice
++  const bool pi_owner = run_pi;
++  if (queued) {
++    qstate = QueueState();  // one-shot as well
++  }
 +
 +  result.reserve(edge_map.size());
 +  for (auto& [key, edge] : edge_map) {
@@ -11799,7 +12033,12 @@ index 0000000000..b7353993f3
 +    // Index for the partition merge step: "S" = segment (input-port side or one
 +    // launch), "K" = edge_map key in first-insert order, "P" = counters.
 +    std::ofstream index(base + "/io_partition_index.csv");
-+    index << "#partition=" << part.id << "/" << part.total << "\n";
++    index << "#partition=" << part.id << "/" << part.total;
++    if (queued) {
++      // queue mode: the input-port side belongs to the process with pi=1
++      index << " queue=1 pi=" << (pi_owner ? 1 : 0);
++    }
++    index << "\n";
 +    index << "P," << pi_setup_ct << "," << pi_hold_ct << "," << pi_removal_ct
 +          << "," << pi_recovery_ct << "," << po_setup_ct << "," << po_hold_ct
 +          << "," << retained << "," << unsupported << "\n";
@@ -12124,7 +12363,21 @@ index 0000000000..b7353993f3
 +  std::vector<size_t> part_edge_end;  // edges.size() after each source
 +  std::vector<long> part_event_end;   // admission byte offset after each source
 +  const size_t n_all_sources = all_sources.size();
-+  if (part.total > 1) {
++  // Queue mode (dynamic launch distribution, see claimQueueItem).
++  const std::string qpath = part.total > 1 ? queuePath() : std::string();
++  const bool queued = !qpath.empty();
++  QueueState& qstate = queueState();
++  qstate = QueueState();
++  if (queued) {
++    logger_->info(utl::CTS,
++                  2139,
++                  "Timing graph: process {}/{} takes launches from the work "
++                  "queue {} ({} sources)",
++                  part.id,
++                  part.total,
++                  qpath,
++                  all_sources.size());
++  } else if (part.total > 1) {
 +    logger_->info(utl::CTS,
 +                  618,
 +                  "Timing graph: partition {}/{} ({} of {} sources)",
@@ -12136,7 +12389,18 @@ index 0000000000..b7353993f3
 +  }
 +
 +  std::vector<SourceFF> sources;
-+  if (part.total <= 1) {
++  // Queue mode: the whole launch universe in name order; launches are appended
++  // to `sources` as chunks are claimed.
++  std::vector<LaunchMember> ranked;
++  if (queued) {
++    int n_universe = 0;
++    ranked = partitionMembers(
++        odb_registers_, network_, LaunchPartition(), &n_universe);
++    if (n_universe != static_cast<int>(all_sources.size())) {
++      logger_->error(utl::CTS, 2133, "Launch queue universe mismatch");
++    }
++    sources.reserve(all_sources.size());
++  } else if (part.total <= 1) {
 +    sources = std::move(all_sources);
 +  } else {
 +    // Members in name order; member.order indexes all_sources (both skip
@@ -12410,12 +12674,16 @@ index 0000000000..b7353993f3
 +    consumeEnds(idx, min_ends, launch_set, false);
 +  };
 +
-+  const int n_sources = static_cast<int>(sources.size());
++  // Static mode: the number of launches of this process; queue mode: the
++  // universe (progress lines count the launches done so far).
++  const int n_sources = queued ? static_cast<int>(ranked.size())
++                               : static_cast<int>(sources.size());
 +
 +  auto t0 = std::chrono::high_resolution_clock::now();
 +  const auto t_loop = std::chrono::steady_clock::now();
 +
-+  for (int idx = 0; idx < n_sources; ++idx) {
++  // One launch: query, admit, index bookkeeping, progress line.
++  auto runLaunch = [&](int idx) {
 +    cur_stash = &po_cache.by_reg[sources[idx].odb_inst];
 +
 +    fusedExtract(idx);
@@ -12426,7 +12694,7 @@ index 0000000000..b7353993f3
 +    }
 +
 +    const int processed = idx + 1;
-+    if (processed % 500 == 0 || processed == n_sources) {
++    if (processed % 500 == 0 || (!queued && processed == n_sources)) {
 +      auto t1 = std::chrono::high_resolution_clock::now();
 +      double elapsed = std::chrono::duration<double>(t1 - t0).count();
 +      logger_->info(utl::CTS,
@@ -12439,6 +12707,90 @@ index 0000000000..b7353993f3
 +                    total_sta_calls,
 +                    elapsed);
 +    }
++  };
++
++  int q_chunk = 0, q_chunks_taken = 0;
++  long q_items = 0;
++  double q_claim_s = 0.0, q_pi_s = 0.0;
++  if (!queued) {
++    for (int idx = 0; idx < n_sources; ++idx) {
++      runLaunch(idx);
++    }
++  } else {
++    const int n_rank = static_cast<int>(ranked.size());
++    q_chunk = queueChunk(n_rank, part.total);
++    const std::vector<long> chunk_start
++        = queueChunkStarts(n_rank, part.total, q_chunk);
++    const long n_chunks = static_cast<long>(chunk_start.size()) - 1;
++    q_items = 1 + n_chunks;  // item 0 = input-port side
++    const int fd = open(qpath.c_str(), O_RDWR);
++    if (fd < 0) {
++      logger_->error(
++          utl::CTS, 2134, "Cannot open the launch queue file {}", qpath);
++    }
++    while (true) {
++      const auto tc = std::chrono::steady_clock::now();
++      const long item = claimQueueItem(fd, q_items);
++      q_claim_s += std::chrono::duration<double>(
++                       std::chrono::steady_clock::now() - tc)
++                       .count();
++      if (item == -2) {
++        close(fd);
++        logger_->error(
++            utl::CTS, 2137, "Cannot read or lock the launch queue {}", qpath);
++      }
++      if (item < 0) {
++        break;
++      }
++      if (item == 0) {
++        // Input-port side of the IO pass, replayed by this process's IO pass.
++        const auto tp = std::chrono::steady_clock::now();
++        qstate.pi = computeInputPortSide(sta_,
++                                         network_,
++                                         block_,
++                                         n_path_limit,
++                                         latch_cache,
++                                         inst_to_name,
++                                         ff_clock_cache,
++                                         logger_);
++        qstate.pi_owner = true;
++        q_pi_s = std::chrono::duration<double>(
++                     std::chrono::steady_clock::now() - tp)
++                     .count();
++        continue;
++      }
++      ++q_chunks_taken;
++      const long first = chunk_start[item - 1];
++      const long last = chunk_start[item];
++      for (long r = first; r < last; ++r) {
++        const LaunchMember& member = ranked[r];
++        if (member.order < 0 || member.order >= static_cast<int>(n_all_sources)
++            || all_sources[member.order].odb_inst != member.inst) {
++          logger_->error(utl::CTS, 2136, "Launch queue order mismatch");
++        }
++        const int idx = static_cast<int>(sources.size());
++        sources.push_back(all_sources[member.order]);
++        part_order.push_back(member.order);
++        SourceInfo si;
++        fillFromODB(member.inst, si.x, si.y, si.tier);
++        src_info_cache[member.inst] = si;
++        odb_to_src_idx[member.inst] = idx;
++        qstate.claimed.push_back(member);
++        runLaunch(idx);
++      }
++    }
++    close(fd);
++    logger_->info(utl::CTS,
++                  2135,
++                  "Timing graph queue: {} chunks of {} launches ({} sources) "
++                  "of {} items, input-port side {} ({:.1f}s), claims {:.2f}s",
++                  q_chunks_taken,
++                  q_chunk,
++                  sources.size(),
++                  q_items,
++                  qstate.pi_owner ? "here" : "elsewhere",
++                  q_pi_s,
++                  q_claim_s);
 +  }
 +
 +  auto t_end = std::chrono::high_resolution_clock::now();
@@ -12451,7 +12803,7 @@ index 0000000000..b7353993f3
 +                edges.size(),
 +                setup_found,
 +                hold_found,
-+                n_sources,
++                sources.size(),
 +                total_sta_calls,
 +                total_elapsed);
 +
@@ -12495,7 +12847,14 @@ index 0000000000..b7353993f3
 +          << " edges=" << (edges.size() - sources.size())
 +          << " retained=" << retained << " unsupported=" << unsupported
 +          << " inactive_source_modes=" << empty_queries
-+          << " prequery_s=" << prequery_s << "\n";
++          << " prequery_s=" << prequery_s;
++    if (queued) {
++      index << " queue=1 chunk=" << q_chunk << " items=" << q_items
++            << " chunks_taken=" << q_chunks_taken
++            << " pi=" << (qstate.pi_owner ? 1 : 0) << " claim_s=" << q_claim_s
++            << " pi_s=" << q_pi_s;
++    }
++    index << "\n";
 +    index << "order,edge_end,event_end,name\n";
 +    for (size_t i = 0; i < sources.size(); ++i) {
 +      index << part_order[i] << "," << part_edge_end[i] << ","
@@ -12506,6 +12865,12 @@ index 0000000000..b7353993f3
 +  po_cache.block = block_;
 +  timingFingerprint(sta_, po_cache.fingerprint);
 +  po_cache.valid = true;
++  if (queued) {
++    // Hand the claimed launches (and the input-port side) to the IO pass.
++    qstate.block = block_;
++    std::memcpy(qstate.fingerprint, po_cache.fingerprint, sizeof(qstate.fingerprint));
++    qstate.valid = true;
++  }
 +
 +  return edges;
 +}
