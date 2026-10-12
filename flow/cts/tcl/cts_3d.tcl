@@ -4,8 +4,9 @@
 #                      design, propagated-clock reference state) and exits.
 # CTS_STAGE=delivery : stage D.  Reads the stage-G sequential graph, solves the useful-skew LP, builds the delivery
 #                      tree (H-tree + shared delay chains), repairs and legalizes the new clock cells and writes
-#                      4_cts.{odb,def,v,sdc}.  The LP target check (cts_checks targets) runs in the background and
-#                      leaves verify_targets.rc in RESULTS_DIR (stage J waits for it).
+#                      4_cts.{odb,sdc} (stage R reads the database and writes the DEF/Verilog of its checkpoint).
+#                      The LP target check (cts_checks targets) runs in the background and leaves verify_targets.rc
+#                      in RESULTS_DIR (stage J waits for it).
 # Optional: EARLY_CLOCK_PLAN = early-clock plan (decision output) applied right after clock_tree_synthesis in both
 # stages, so the Phase-1 reference and the delivery tree carry the same early structure.
 
@@ -61,6 +62,9 @@ set lp_weight_io   1.0     ;# weight of the IO (PI->FF / FF->PO) constraint pena
 set lp_max_skew    0.05    ;# upper bound of a scheduled arrival increment
 cts::solve_skew_lp $lp_sigma_local $lp_sigma_pi $lp_lambda_reg $lp_hold_margin $lp_gamma_wns $lp_weight_io $lp_max_skew
 puts ">>> LP elapsed: [expr {[clock seconds] - $t0}]s"
+# the LP targets (the only delivery output the early-clock decision reads) are complete: the decision may start while
+# this session builds the delivery tree (cts_flow.sh)
+close [open $results/lp_targets.done w]
 # independent check of the LP targets against the graph (TARGET_VERIFICATION.json, exit code in verify_targets.rc)
 set vt $::env(CTS3D_CTS_DIR)/native/bin/cts_checks
 exec sh -c "'$vt' targets '$results' > '$results/verify_targets.log' 2>&1; echo \$? > '$results/verify_targets.rc'" < /dev/null > /dev/null 2> /dev/null &
@@ -291,8 +295,6 @@ relegalize_clock_buffers $block $snap phase4 "$results/clock_relegalize_D.csv"
 puts ">>> Repair + legalization elapsed: [expr {[clock seconds] - $t0}]s"
 
 write_db $results/4_cts.odb
-write_def $results/4_cts.def
-write_verilog $results/4_cts.v
 write_sdc $results/4_cts.sdc
-puts ">>> 4_cts.{odb,def,v,sdc} written"
+puts ">>> 4_cts.{odb,sdc} written"
 exit

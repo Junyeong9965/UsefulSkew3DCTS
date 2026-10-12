@@ -30,4 +30,4 @@ if [[ $stage == delivery ]]; then
   else "$NATIVE/cts_checks" inputs "$results"; fi
 fi
 cd "$FLOW_HOME_DIR"
-exec nice -n 19 make DESIGN_CONFIG="designs/$platform/$design/config_cts.mk" ord-cts-3d
+exec make DESIGN_CONFIG="designs/$platform/$design/config_cts.mk" ord-cts-3d

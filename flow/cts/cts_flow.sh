@@ -3,6 +3,7 @@
 #   usage: cts_flow.sh <case> <placement_dir> <run_dir>
 #
 #   OFF chain   P -> G -> [GB] -> D -> [GA] -> R -> J -> Q -> F   (arms/off; stages in cts_stage.sh)
+#               (the decision starts as soon as D has written its LP targets)
 #   decision    one session (early_decision.tcl) on the OFF phase1.odb: early-group selection or, when no tier has a
 #               valid shift model, single-root hub candidates; result in decide/DECISION.txt and a plan.tsv
 #   ON chain    the same chain with the early-clock plan, only when the decision returned a plan and (by default,
@@ -113,15 +114,32 @@ say "        OpenROAD $CTS3D_OPENROAD"
 say "        step logs: $RUN/logs/   (columns: elapsed h:m:s | step | wall | cpu | peak memory)"
 
 # ---------------------------------------------------------------------------------------------- OFF chain
-chain off "$RUN/arms/off" "$RUN" P G GB D
-nid_check off "$RUN"
-[[ -e $RUN/arms/off/.guarded ]] && chain off "$RUN/arms/off" "$RUN" GA
-
 # ---------------------------------------------------------------------------------------------- OFF refinement
-# R J Q F of the OFF arm do not depend on the decision; with CTS3D_PARALLEL_ARMS=1 they start here.
+# R J Q F of the OFF arm do not depend on the decision; with CTS3D_PARALLEL_ARMS=1 they run while the decision works.
+# The decision reads three OFF-arm files: P/phase1_leaf_groups.csv, the stage-G graph and D/pre_cts_skew_targets.csv
+# (the LP targets, written right after the LP and before the delivery tree; cts_3d.tcl then writes
+# D/lp_targets.done).  In parallel mode with the decision enabled, the OFF arm continues from D in the background and
+# the decision starts as soon as that marker exists, so it overlaps the rest of D as well as R..F.  The stage outputs
+# do not depend on when the decision starts.
 PAR=${CTS3D_PARALLEL_ARMS:-1}
 off_pid=""
-if [[ $PAR == 1 ]]; then ( chain off "$RUN/arms/off" "$RUN" R J Q F ) & off_pid=$!; fi
+DEC_AT_LP=0
+[[ $PAR == 1 && ${CTS3D_EARLY_CLOCK:-1} == 1 ]] && DEC_AT_LP=1
+if [[ $DEC_AT_LP == 1 ]]; then
+  chain off "$RUN/arms/off" "$RUN" P G GB
+  ( chain off "$RUN/arms/off" "$RUN" D
+    nid_check off "$RUN"
+    [[ ! -e $RUN/arms/off/.guarded ]] || chain off "$RUN/arms/off" "$RUN" GA
+    chain off "$RUN/arms/off" "$RUN" R J Q F ) & off_pid=$!
+  dm=$RUN/arms/off/D/$sub/lp_targets.done
+  while [[ ! -e $dm ]]; do kill -0 "$off_pid" 2>/dev/null || break; sleep 2; done
+  if [[ ! -e $dm ]]; then wait "$off_pid"; echo "FAILED arm=off (before the LP targets of D)" | tee -a "$T"; exit 1; fi
+else
+  chain off "$RUN/arms/off" "$RUN" P G GB D
+  nid_check off "$RUN"
+  [[ -e $RUN/arms/off/.guarded ]] && chain off "$RUN/arms/off" "$RUN" GA
+  if [[ $PAR == 1 ]]; then ( chain off "$RUN/arms/off" "$RUN" R J Q F ) & off_pid=$!; fi
+fi
 
 # ---------------------------------------------------------------------------------------------- decision
 # CTS3D_EARLY_CLOCK=0 (run_cts.sh --early off): no decision and no ON arm; the output is the OFF arm.
@@ -159,7 +177,8 @@ if [[ -n $plan && ${CTS3D_ON_GATE:-1} == 1 ]]; then
   fi
 fi
 echo "DECISION plan=${plan:-none} reason=$reason" >> "$T"
-trim "$RUN/arms/off/P/$sub/phase1.odb"   # read by G, GB, D and the decision probes; nothing later
+# read by G, GB, D and the decision probes; nothing later (when D may still run, it is trimmed after the OFF arm)
+[[ $DEC_AT_LP == 1 ]] || trim "$RUN/arms/off/P/$sub/phase1.odb"
 
 # ---------------------------------------------------------------------------------------------- arms after the decision
 # The OFF, ON and multi-hub prefix arms use separate directories and THREADS each; with CTS3D_PARALLEL_ARMS=0 they run
@@ -219,6 +238,7 @@ if [[ $kind == hub ]]; then
 fi
 if [[ -n $off_pid ]]; then   # parallel mode: the OFF chain started before the decision; its preparation runs here
   wait "$off_pid" || { echo "FAILED arm=off" | tee -a "$T"; branch_wait; exit 1; }
+  [[ $DEC_AT_LP != 1 ]] || trim "$RUN/arms/off/P/$sub/phase1.odb"
   [[ -z $plan ]] || prep_native "$RUN/arms/off" "$RUN/route_prep/off" "$RUN/out" off
 fi
 branch_wait

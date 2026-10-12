@@ -25,6 +25,8 @@ stage=$1; arm=$2; platform=$3; design=$4; src=$5; c=$6
 # K = graph-extraction processes (1 thread each); the merged graph does not depend on K
 TH=${THREADS:-16}; K=$(( TH > 1 ? TH : 2 ))
 D_TH=$(( TH < 12 ? TH : 12 )); R_TH=$(( TH < 14 ? TH : 14 ))
+# stage P: at most 16 threads (the Phase-1 outputs do not depend on the thread count)
+P_TH=$(( TH < 16 ? TH : 16 ))
 sub=results/$platform/$design/openroad
 P=$arm/P/$sub; G=$arm/G; D=$arm/D/$sub; GD=$arm/guard; R=$arm/R/$sub; Q=$arm/Q/$sub
 logs=$(cd "$arm/../.." && pwd)/logs; mkdir -p "$logs"; an=$(basename "$arm")
@@ -40,7 +42,7 @@ recipe_d() {
 
 stage_P() {
   rm -rf "$arm/P"; mkdir -p "$P"
-  env $(recipe_p1) bash "$CTS_DIR/cts_session.sh" "$arm/P" "$platform" "$design" "$src" phase1 "$TH" > "$logs/${an}_P.log" 2>&1
+  env $(recipe_p1) bash "$CTS_DIR/cts_session.sh" "$arm/P" "$platform" "$design" "$src" phase1 "$P_TH" > "$logs/${an}_P.log" 2>&1
   echo "P session_rc=$?"
   # macros.txt may be empty (design without macros); every other file must be non-empty
   for f in phase1.odb phase1.sdc phase1.metrics pre_cts_leaf_bounds.csv cts_base_latency.csv phase1_leaf_groups.csv macros.txt; do
@@ -118,7 +120,7 @@ stage_D() {
   env $(recipe_d) CTS_LP_INCREMENTAL_BOUNDS_CSV="$D/lp_bounds.csv" \
     bash "$CTS_DIR/cts_session.sh" "$arm/D" "$platform" "$design" "$src" delivery "$D_TH" > "$logs/${an}_D.log" 2>&1
   local rc=$?; echo "D session_rc=$rc"
-  [[ $rc == 0 && -s $D/4_cts.odb && -s $D/4_cts.def && -s $D/pre_cts_skew_targets.csv ]]
+  [[ $rc == 0 && -s $D/4_cts.odb && -s $D/pre_cts_skew_targets.csv ]]
 }
 
 stage_GA() {
@@ -147,7 +149,7 @@ stage_R() {
   # the refined checkpoint keeps the delivery SDC byte for byte (write_sdc only reformats it)
   cp -fL "$D/4_cts.sdc" "$R/4_cts.sdc"
   [[ -s $R/4_cts.odb && -s $R/4_cts.def ]] || return 1
-  trim "$D/4_cts.odb" "$D/4_cts.def" "$D/4_cts.v"   # the refined checkpoint supersedes the delivery checkpoint
+  trim "$D/4_cts.odb"   # the refined checkpoint supersedes the delivery checkpoint
 }
 
 stage_J() {

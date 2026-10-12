@@ -1,9 +1,9 @@
 # Tier-exact legalization of post-CTS cells (stages P and D).
 #
 # For each tier t: every non-fixed standard cell of t is movable, detailed_placement runs with DPL_TIER_ONLY=t (only
-# tier t is in the placement grid: same XY as a cell of the other tier is legal, a same-tier overlap is not), and a
-# per-tier check_placement is logged.  Cells that are already legal keep their sites unless a post-CTS cell needs
-# them.  The bottom tier of asap7_nangate45_3D has no NanGate45 rows in the merged DEF: the ASAP7 rows are saved,
+# tier t is in the placement grid: same XY as a cell of the other tier is legal, a same-tier overlap is not).  Cells
+# that are already legal keep their sites unless a post-CTS cell needs them (legality of the CTS output is checked by
+# the same-tier overlap check in route_prep.sh).  The bottom tier of asap7_nangate45_3D has no NanGate45 rows in the merged DEF: the ASAP7 rows are saved,
 # replaced by temporary NanGate45 rows on the 0.190 x 1.400 um grid of the placed bottom cells for that pass, and
 # restored exactly afterwards (same row order and core area).  Placement statuses are restored at the end.
 # A pre-CTS cell that is off its site grid was moved by the CTS step (e.g. a clock gater) and counts as post-CTS.
@@ -111,7 +111,6 @@ proc legalize_new_cells_by_tier {block pre_dict label} {
     if {$hb} { set saved [tl_rows_to_ng45 $block] }
     set ::env(DPL_TIER_ONLY) $tier
     set rc [catch {detailed_placement} err]
-    set crc [catch {check_placement -verbose} cerr]
     unset ::env(DPL_TIER_ONLY)
     if {$hb} { tl_restore_rows $block $saved }
     foreach grp {movable others} {
@@ -124,7 +123,7 @@ proc legalize_new_cells_by_tier {block pre_dict label} {
       }
     }
     incr moved_total [expr {$moved(movable) + $moved(others)}]
-    puts "TIER_LEGAL $label tier=$tier post_cts=[llength $movable] moved=$moved(movable) max_disp_dbu=$dmax(movable) sum_disp_dbu=$dsum(movable) pre_cts_moved=$moved(others) pre_max_disp_dbu=$dmax(others) pre_sum_disp_dbu=$dsum(others) dpl_rc=$rc check_rc=$crc [expr {$rc ? $err : ""}] [expr {$crc ? $cerr : ""}]"
+    puts "TIER_LEGAL $label tier=$tier post_cts=[llength $movable] moved=$moved(movable) max_disp_dbu=$dmax(movable) sum_disp_dbu=$dsum(movable) pre_cts_moved=$moved(others) pre_max_disp_dbu=$dmax(others) pre_sum_disp_dbu=$dsum(others) dpl_rc=$rc [expr {$rc ? $err : ""}]"
   }
   dict for {n s} $status { set i [$block findInst $n]; if {[$i getPlacementStatus] ne $s} { $i setPlacementStatus $s } }
   return $moved_total
