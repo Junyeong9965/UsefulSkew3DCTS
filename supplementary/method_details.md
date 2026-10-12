@@ -48,8 +48,8 @@ $$
 c_i=\max(0,a_i-\hat a_i)+\max(0,\hat a_i-H_i)+0.1\max(0,\hat a_i-a_i),
 $$
 
-where $\hat a_i$ is the delivered delay and $H_i$ the hold budget of register $i$. The delivered delay of a register
-can differ from its target.
+where $\hat a_i$ is the delivered delay and $H_i$ the hold budget of register $i$. The delivered delays are compared
+with the targets in [Realization of Delay Targets](README.md#realization-of-delay-targets).
 
 ## Clock Tree Refinement
 

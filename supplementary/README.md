@@ -1,7 +1,7 @@
 # Supplementary Results
 
-Experiments that are not reported in the paper. All results use the same ten cases, placements and clock periods
-as Table I of the paper.
+Experiments that are not reported in the paper. All results use the ten cases, placements and clock periods listed
+in [Benchmarks](../README.md#benchmarks).
 
 - [Post-CTS timing](#post-cts-timing)
 - [CTS runtime](#cts-runtime)
@@ -32,9 +32,9 @@ Data: [`data/post_cts_timing.csv`](data/post_cts_timing.csv).
 ## CTS Runtime
 
 CTS wall time measured on the same server for both flows. Our CTS takes 4.2× to 7.5× the CTS time of Pin-3D.
-Pin-3D runs a single balanced CTS with clock buffers on one tier and no timing analysis inside CTS. Our flow
-additionally extracts the register timing graph with STA, solves the scheduling LP, and evaluates early-clock
-construction and refinement moves with whole-design STA.
+Pin-3D runs a single balanced CTS with clock buffers on one tier. Our flow additionally extracts the register timing
+graph with STA, solves the scheduling LP, and evaluates early-clock construction and refinement moves with
+whole-design STA.
 
 <p align="center"><img src="../images/runtime_total.png" width="100%" alt="CTS runtime"></p>
 
