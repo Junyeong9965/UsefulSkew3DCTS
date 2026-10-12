@@ -1,6 +1,7 @@
 #pragma once
 // Shared helpers of the native flow tools (flow/cts/native): file / CSV reading, number formatting, JSON reading and
-// writing, sha256 and path helpers.  Same code as EarlyUtil.h of the OpenROAD patch.
+// writing, sha256 and path helpers.  Same code as EarlyUtil.h of the OpenROAD patch, plus TableStream (streaming
+// table reader of the flow tools only).
 
 #include <algorithm>
 #include <climits>
@@ -17,7 +18,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -225,6 +228,61 @@ inline Table read_table(const std::string& path, char sep = ',')
   }
   return t;
 }
+// Row-by-row reader with the parsing rules of read_table (lines as read_lines: '\n' separated, one trailing CR
+// stripped; blank lines skipped; fields as split_csv_line; short rows padded with ""), for tables too large to hold in
+// memory (the stage-G graph has > 10 M rows).  Fields are returned as views, valid until the next call; a line without
+// '"' is split in place (identical to split_csv_line on such a line), other lines go through split_csv_line.
+class TableStream
+{
+ public:
+  std::vector<std::string> header;
+  std::unordered_map<std::string, int> index;
+  explicit TableStream(const std::string& path, char sep = ',') : in_(path, std::ios::binary), sep_(sep)
+  {
+    if (!in_) fail("cannot read " + path);
+    if (!std::getline(in_, line_)) fail("empty table " + path);
+    if (!line_.empty() && line_.back() == '\r') line_.pop_back();
+    header = split_csv_line(line_, sep_);
+    for (size_t i = 0; i < header.size(); ++i) index.emplace(header[i], (int) i);
+  }
+  int col(const std::string& name) const
+  {
+    auto it = index.find(name);
+    if (it == index.end()) fail("missing column " + name);
+    return it->second;
+  }
+  // fields of the next non-blank row; false at the end of the file
+  bool next(std::vector<std::string_view>& f)
+  {
+    while (std::getline(in_, line_)) {
+      if (!line_.empty() && line_.back() == '\r') line_.pop_back();
+      if (line_.empty()) continue;   // blank lines are skipped
+      f.clear();
+      if (line_.find('"') == std::string::npos) {
+        std::string_view l(line_);
+        size_t a = 0;
+        while (true) {
+          size_t b = l.find(sep_, a);
+          if (b == std::string_view::npos) { f.push_back(l.substr(a)); break; }
+          f.push_back(l.substr(a, b - a));
+          a = b + 1;
+        }
+      } else {
+        quoted_ = split_csv_line(line_, sep_);
+        for (auto& s : quoted_) f.push_back(s);
+      }
+      while (f.size() < header.size()) f.push_back(std::string_view());   // missing trailing fields read as empty
+      return true;
+    }
+    return false;
+  }
+
+ private:
+  std::ifstream in_;
+  char sep_;
+  std::string line_;
+  std::vector<std::string> quoted_;
+};
 // CSV field, quoted only if it contains a comma, quote, CR or LF
 inline std::string csv_field(const std::string& s)
 {

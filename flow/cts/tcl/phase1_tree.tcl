@@ -86,41 +86,51 @@ if {[catch {cts::estimate_leaf_latencies $bounds_csv 0.05} err]} {
   puts ">>> \[Phase 1\] Leaf bounds written to $bounds_csv"
 }
 
-# per-register clock latency of the reference tree: capture clock delay of the worst setup / hold paths, then the
-# launch clock latency of their startpoints (first value per register wins)
-set num_paths 10000
-array set lat {}
-if {[catch {
-  foreach path_end [find_timing_paths -sort_by_slack -path_delay max -group_path_count $num_paths] {
-    set ff [regsub {/[^/]+$} [get_full_name [$path_end pin]] ""]
-    if {![info exists lat($ff)]} { set lat($ff) [expr {[$path_end target_clk_delay] * 1e12}] }
-    set pins [[$path_end path] pins]
-    if {[llength $pins] > 0} {
-      set lff [regsub {/[^/]+$} [get_full_name [lindex $pins end]] ""]
-      if {![info exists lat($lff)]} { set lat($lff) [expr {[$path_end source_clk_latency] * 1e12}] }
+# per-register clock latency of the reference tree (cts_base_latency.csv): read only by the delivery balancer with
+# CTS_BALANCER_BASE_RESTORE=1 (BAL_BASE=1, the ibex designs). Other cases (BAL_BASE=0 from cts_flow.sh) get a header-only
+# file and skip the two path enumerations; with BAL_BASE unset (stand-alone run) the file is always written.
+if {[info exists ::env(BAL_BASE)] && $::env(BAL_BASE) == 0} {
+  set fp [open "$results/cts_base_latency.csv" w]
+  puts $fp "ff_name,base_latency_ps"
+  close $fp
+  puts ">>> \[Phase 1\] Base latency not needed (BAL_BASE=0): header-only file"
+} else {
+  # per-register clock latency of the reference tree: capture clock delay of the worst setup / hold paths, then the
+  # launch clock latency of their startpoints (first value per register wins)
+  set num_paths 10000
+  array set lat {}
+  if {[catch {
+    foreach path_end [find_timing_paths -sort_by_slack -path_delay max -group_path_count $num_paths] {
+      set ff [regsub {/[^/]+$} [get_full_name [$path_end pin]] ""]
+      if {![info exists lat($ff)]} { set lat($ff) [expr {[$path_end target_clk_delay] * 1e12}] }
+      set pins [[$path_end path] pins]
+      if {[llength $pins] > 0} {
+        set lff [regsub {/[^/]+$} [get_full_name [lindex $pins end]] ""]
+        if {![info exists lat($lff)]} { set lat($lff) [expr {[$path_end source_clk_latency] * 1e12}] }
+      }
     }
+  } err]} {
+    puts "WARNING: \[Phase 1\] Setup path extraction: $err"
   }
-} err]} {
-  puts "WARNING: \[Phase 1\] Setup path extraction: $err"
-}
-puts ">>> \[Phase 1\] Pass 1 (setup): [array size lat] FFs covered"
-if {[catch {
-  foreach path_end [find_timing_paths -sort_by_slack -path_delay min -group_path_count $num_paths] {
-    set ff [regsub {/[^/]+$} [get_full_name [$path_end pin]] ""]
-    if {![info exists lat($ff)]} { set lat($ff) [expr {[$path_end target_clk_delay] * 1e12}] }
-    set pins [[$path_end path] pins]
-    if {[llength $pins] > 0} {
-      set lff [regsub {/[^/]+$} [get_full_name [lindex $pins end]] ""]
-      if {![info exists lat($lff)]} { set lat($lff) [expr {[$path_end source_clk_latency] * 1e12}] }
+  puts ">>> \[Phase 1\] Pass 1 (setup): [array size lat] FFs covered"
+  if {[catch {
+    foreach path_end [find_timing_paths -sort_by_slack -path_delay min -group_path_count $num_paths] {
+      set ff [regsub {/[^/]+$} [get_full_name [$path_end pin]] ""]
+      if {![info exists lat($ff)]} { set lat($ff) [expr {[$path_end target_clk_delay] * 1e12}] }
+      set pins [[$path_end path] pins]
+      if {[llength $pins] > 0} {
+        set lff [regsub {/[^/]+$} [get_full_name [lindex $pins end]] ""]
+        if {![info exists lat($lff)]} { set lat($lff) [expr {[$path_end source_clk_latency] * 1e12}] }
+      }
     }
+  } err]} {
+    puts "WARNING: \[Phase 1\] Hold path extraction: $err"
   }
-} err]} {
-  puts "WARNING: \[Phase 1\] Hold path extraction: $err"
+  puts ">>> \[Phase 1\] Pass 2 (hold):  [array size lat] FFs covered total"
+  set fp [open "$results/cts_base_latency.csv" w]
+  puts $fp "ff_name,base_latency_ps"
+  foreach ff [lsort [array names lat]] { puts $fp "$ff,[format %.3f $lat($ff)]" }
+  close $fp
+  puts ">>> \[Phase 1\] Base latency written ([array size lat] FFs)"
 }
-puts ">>> \[Phase 1\] Pass 2 (hold):  [array size lat] FFs covered total"
-set fp [open "$results/cts_base_latency.csv" w]
-puts $fp "ff_name,base_latency_ps"
-foreach ff [lsort [array names lat]] { puts $fp "$ff,[format %.3f $lat($ff)]" }
-close $fp
-puts ">>> \[Phase 1\] Base latency written ([array size lat] FFs)"
 exit

@@ -5,7 +5,8 @@
 #   OFF chain   P -> G -> [GB] -> D -> [GA] -> R -> J -> Q -> F   (arms/off; stages in cts_stage.sh)
 #   decision    one session (early_decision.tcl) on the OFF phase1.odb: early-group selection or, when no tier has a
 #               valid shift model, single-root hub candidates; result in decide/DECISION.txt and a plan.tsv
-#   ON chain    the same chain with the early-clock plan, only when the decision returned a plan   (arms/on)
+#   ON chain    the same chain with the early-clock plan, only when the decision returned a plan and (by default,
+#               CTS3D_ON_GATE=1) the ON-benefit check of the decision predictions passes                (arms/on)
 #   selection   route-input preparation and independent STA reload of both arms, plan check; cts_select output
 #               selects ON if it accepts the ON arm, else OFF
 #   multi-hub   after a hub decision only: prefixes k = 2..3 of the measured hub candidates are built as ON chains
@@ -105,6 +106,7 @@ prep_native() { local dir=$1 prep=$2 o=$3 tag=$4
 
 say "3D CTS  case $c  ($plat / $des, clock period ${src##*/T} ps)"
 early=off; [[ ${CTS3D_EARLY_CLOCK:-1} != 1 ]] || early=on
+[[ ${CTS3D_ON_GATE:-1} == 1 || $early != on ]] || early=full
 say "        host $(hostname -s), threads $THREADS, early-clock construction $early"
 say "        placement $src"
 say "        OpenROAD $CTS3D_OPENROAD"
@@ -128,8 +130,9 @@ if [[ ${CTS3D_EARLY_CLOCK:-1} == 1 ]]; then
   DEC=$RUN/decide; mkdir -p "$DEC"
   P1=$RUN/arms/off/P/$sub
   setrc=$(platform_setrc "$plat")
-  # clock-tree and clock-net dumps, calibration, early groups and, without a valid shift model, the hub candidates
-  export EARLY_DEC=$DEC EARLY_REF_ARM=$RUN/arms/off EARLY_CASE=$c EARLY_SETRC=$setrc EARLY_RUN=$RUN
+  # clock-tree and clock-net dumps, calibration, early groups and, without a valid shift model, the hub candidates;
+  # the session runs on 4 threads, the hub-candidate generation (thread-count independent result) on THREADS
+  export EARLY_DEC=$DEC EARLY_REF_ARM=$RUN/arms/off EARLY_CASE=$c EARLY_SETRC=$setrc EARLY_RUN=$RUN EARLY_HUB_THREADS=$THREADS
   st DEC bash "$CTS_DIR/openroad_run.sh" "$DEC/session" "$plat" "$des" "$P1/phase1.odb" "$P1/phase1.sdc" "$CTS_DIR/tcl/early_decision.tcl" 4
   dget() { sed -n "s/^$1=//p" "$DEC/DECISION.txt" | tail -1; }
   status=$(dget early_groups_status)
@@ -142,6 +145,17 @@ if [[ ${CTS3D_EARLY_CLOCK:-1} == 1 ]]; then
     if [[ -n $cid && -s $H/plan/plan.tsv ]]; then plan=$H/plan/plan.tsv; reason="hub $cid"; kind=hub
     else reason="model_invalid; no valid hub candidate"; fi
   else reason=$status
+  fi
+fi
+# ON-benefit gate (CTS3D_ON_GATE=1, default; 0 = no gate): from the decision's own predictions only (cts_select gate:
+# predicted TNS gain relative to the Phase-1 TNS and predicted setup WNS change of the selected plan; no STA, no CTS),
+# skip the ON arm and the multi-hub prefixes when ON is not expected to be worthwhile.  The decision files and
+# out/gate.json are kept either way.
+if [[ -n $plan && ${CTS3D_ON_GATE:-1} == 1 ]]; then
+  g=$("$NATIVE/cts_select" gate "$c" "$DEC" "$RUN/out/gate.json") || { echo "FAILED stage=GATE" | tee -a "$T"; exit 1; }
+  echo "GATE $g" >> "$T"   # recorded in work/out only (not in the run log)
+  if [[ $(jget "$RUN/out/gate.json" decision) == skip ]]; then
+    reason="ON-benefit gate skip: $(jget "$RUN/out/gate.json" reason) ($reason)"; plan=""; kind=""
   fi
 fi
 echo "DECISION plan=${plan:-none} reason=$reason" >> "$T"

@@ -6,6 +6,8 @@
 //   cts_select report <run_dir> <case> <output arm> <output arm dir> <reason> [plan]
 //   cts_select multihub <case> <out.json> "<k> <select.json> <arm dir>" ...   (multi-hub prefix verdict)
 //   cts_select jget <file.json> <key>                                           (top-level value, for shell scripts)
+//   cts_select gate <case> <decide dir> <out.json>                               (ON-benefit gate)
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -771,6 +773,63 @@ int multihub_main(const std::vector<std::string>& a)
   return 0;
 }
 
+// ---------------------------------------------------------------- ON-benefit gate (default; CTS3D_ON_GATE=1)
+// Decides, from the early-clock decision files only (no STA, no CTS), whether building the single ON arm is
+// worthwhile relative to OFF.  Inputs: <decide>/DECISION.txt; for an early-group plan <decide>/early_groups/summary.json
+// (base / final = replay of the Phase-1 timing graph before / after the selected groups); for a hub plan the
+// selected row of <decide>/hub/measured.csv (meas_gain, d_setup_wns) and <decide>/hub/gen.json (base).
+//   B      = predicted setup + hold TNS gain (ps);  rel = B / (|base setup TNS| + |base hold TNS|)
+//   risk   = predicted setup WNS loss (ps, >= 0);   tol = min(5 ps, 1 % |base setup WNS|) (same form as the output check)
+// Skip ON when the benefit is negligible (rel < CTS3D_GATE_MIN_REL, default 0.5 %) or when the predicted setup WNS
+// loss exceeds the tolerance even if only CTS3D_GATE_RHO of it is realised (default 0.5).  Anything not covered
+// builds ON.
+int gate_main(const std::vector<std::string>& a)
+{
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::string cas = a.at(0), dec = a.at(1), outf = a.at(2);
+  const char* e1 = std::getenv("CTS3D_GATE_MIN_REL");
+  const char* e2 = std::getenv("CTS3D_GATE_RHO");
+  const double min_rel = e1 && *e1 ? to_double(e1) : 0.005, rho = e2 && *e2 ? to_double(e2) : 0.5;
+  std::map<std::string, std::string> d;
+  for (auto& l : split(read_text(dec + "/DECISION.txt"), '\n')) {
+    auto p = l.find('=');
+    if (p != std::string::npos) d[l.substr(0, p)] = l.substr(p + 1);
+  }
+  std::string kind = "none";
+  double B = 0, dS = 0, bst = 0, bht = 0, bsw = 0;
+  if (d["early_groups_status"] == "selected") {
+    J s = json_load(dec + "/early_groups/summary.json");
+    const J& b = s.get("base"); const J& f = s.get("final");
+    kind = "groups";
+    bst = b.get("st").num(); bht = b.get("ht").num(); bsw = b.get("sw").num();
+    B = (f.get("st").num() - bst) + (f.get("ht").num() - bht);
+    dS = f.get("sw").num() - bsw;
+  } else if (!d["hub_cid"].empty()) {
+    Table t = read_table(dec + "/hub/measured.csv");
+    auto col = [&](const std::string& k) { for (size_t i = 0; i < t.header.size(); ++i) if (t.header[i] == k) return i; fail("missing column " + k); };
+    const size_t ci = col("cid"), cg = col("meas_gain"), cs = col("d_setup_wns");
+    for (auto& r : t.rows) if (r[ci] == d["hub_cid"]) { B = to_double(r[cg]); dS = to_double(r[cs]); kind = "hub"; }
+    if (kind != "hub") fail("hub " + d["hub_cid"] + " not in measured.csv");
+    J g = json_load(dec + "/hub/gen.json");
+    const J& b = g.get("base");
+    bst = b.get("st").num(); bht = b.get("ht").num(); bsw = b.get("sw").num();
+  }
+  const double denom = std::fabs(bst) + std::fabs(bht), rel = denom > 0 ? B / denom : 0;
+  const double risk = std::max(0.0, -dS), tol = std::min(5.0, 0.01 * std::fabs(bsw));
+  std::string decision = "build", why = "predicted benefit and setup WNS risk acceptable";
+  if (kind == "none") { decision = "none"; why = "no early-clock plan"; }
+  else if (rel < min_rel) { decision = "skip"; why = "predicted benefit negligible"; }
+  else if (rho * risk > tol) { decision = "skip"; why = "predicted setup WNS loss beyond tolerance"; }
+  const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+  J o = J::Obj();
+  o.set("case", J::S(cas)); o.set("kind", J::S(kind)); o.set("decision", J::S(decision)); o.set("reason", J::S(why));
+  o.set("pred_tns_gain_ps", J::D(B)); o.set("pred_rel_gain", J::D(rel)); o.set("pred_setup_wns_change_ps", J::D(dS));
+  o.set("tol_ps", J::D(tol)); o.set("rho", J::D(rho)); o.set("min_rel", J::D(min_rel)); o.set("elapsed_us", J::D(us));
+  write_text(outf, o.dump(1));
+  std::printf("%s rel=%.4f dS=%.2f tol=%.2f %s (%.0f us)\n", decision.c_str(), rel, dS, tol, why.c_str(), us);
+  return 0;
+}
+
 int jget_main(const std::string& file, const std::string& key)
 {
   J j = json_load(file);
@@ -800,7 +859,8 @@ int main(int argc, char** argv)
     if (cmd == "report" && a.size() >= 5) return report_main(a);
     if (cmd == "multihub" && a.size() >= 2) return multihub_main(a);
     if (cmd == "jget" && a.size() == 2) return jget_main(a[0], a[1]);
-    std::fprintf(stderr, "usage: cts_select output|plan|overlap|report|multihub|jget ...\n");
+    if (cmd == "gate" && a.size() == 3) return gate_main(a);
+    std::fprintf(stderr, "usage: cts_select output|plan|overlap|report|multihub|jget|gate ...\n");
     return 2;
   } catch (std::exception& e) {
     std::fprintf(stderr, "cts_select: %s\n", e.what());

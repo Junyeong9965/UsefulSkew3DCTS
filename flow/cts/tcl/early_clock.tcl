@@ -63,6 +63,15 @@ proc site_occupancy {block tier site} {
     lappend rows [list [$bb yMin] [$bb yMax] [$bb xMin] [$bb xMax] [$site getWidth] [$r getOrient]]
   }
   set rows [lsort -integer -index 0 $rows]
+  # y0 list (sorted) and the tallest row height: a cell can only overlap rows with y0 in (ylo - hmax, yhi), so each
+  # cell scans that window found by bisection instead of every row (same rows, same test, same order of the
+  # intervals -> identical occupancy; a full scan is O(cells x rows))
+  set ys {}; set hmax 0
+  foreach r $rows {
+    lappend ys [lindex $r 0]
+    if {[lindex $r 1] - [lindex $r 0] > $hmax} { set hmax [expr {[lindex $r 1] - [lindex $r 0]}] }
+  }
+  set nrows [llength $rows]
   array set iv {}
   foreach inst [$block getInsts] {
     if {[$inst getPlacementStatus] eq "NONE" || [$inst getPlacementStatus] eq "UNPLACED"} continue
@@ -71,9 +80,12 @@ proc site_occupancy {block tier site} {
     # cells created by this file are added one by one as they are placed (site_occupancy_add)
     if {[string match "clkbuf_early_*" [$inst getName]] || [string match "clkbuf_hub_*" [$inst getName]]} continue
     set bb [$inst getBBox]; set ylo [$bb yMin]; set yhi [$bb yMax]
-    set i 0
-    foreach r $rows {
-      if {[lindex $r 1] > $ylo && [lindex $r 0] < $yhi} { lappend iv($i) [list [$bb xMin] [$bb xMax]] }
+    # first row with y0 > ylo - hmax; rows below it end at or below ylo
+    set i [expr {[lsearch -sorted -integer -bisect $ys [expr {$ylo - $hmax}]] + 1}]
+    while {$i < $nrows} {
+      set r [lindex $rows $i]
+      if {[lindex $r 0] >= $yhi} break
+      if {[lindex $r 1] > $ylo} { lappend iv($i) [list [$bb xMin] [$bb xMax]] }
       incr i
     }
   }

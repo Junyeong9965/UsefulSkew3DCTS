@@ -1,5 +1,5 @@
 diff --git a/src/cts/include/cts/TritonCTS.h b/src/cts/include/cts/TritonCTS.h
-index c8f3f56302..49cba1a7d6 100644
+index c8f3f56302..3401a0e865 100644
 --- a/src/cts/include/cts/TritonCTS.h
 +++ b/src/cts/include/cts/TritonCTS.h
 @@ -43,6 +43,7 @@ struct Tree;
@@ -10,7 +10,7 @@ index c8f3f56302..49cba1a7d6 100644
  class CtsOptions;
  class TechChar;
  class StaEngine;
-@@ -66,6 +67,42 @@ class TritonCTS
+@@ -66,6 +67,49 @@ class TritonCTS
    void runTritonCts();
    void reportCtsMetrics();
    CtsOptions* getParms() { return options_; }
@@ -49,11 +49,18 @@ index c8f3f56302..49cba1a7d6 100644
 +  // with the STA delay kernel (StagePredictor.cpp); rows are written to
 +  // output_csv, the non-buffer boundary seeds to output_csv.boundaries.csv.
 +  void predictClockArrivals(const char* output_csv);
++  // Fast candidate passes of the decision probes (StagePredictor.cpp): init on the
++  // unedited tree with a complete STA (clock port arrivals, formula self-check,
++  // incremental placement parasitics on; false = check failed, nothing enabled,
++  // use the whole-design path); end = edited nets re-estimated, incremental
++  // parasitics off.
++  bool probeFastInit();
++  void probeFastEnd();
 +
    TechChar* getCharacterization() { return techChar_.get(); }
    odb::dbBlock* getBlock() { return db_->getChip()->getBlock(); }
    int setClockNets(const char* names);
-@@ -115,6 +152,10 @@ class TritonCTS
+@@ -115,6 +159,10 @@ class TritonCTS
    void destroyClockModNet(sta::Pin* pin_driver);
    void writeClockNetsToDb(TreeBuilder* builder,
                            std::set<odb::dbNet*>& clkLeafNets);
@@ -64,7 +71,7 @@ index c8f3f56302..49cba1a7d6 100644
    void writeClockNDRsToDb(TreeBuilder* builder);
    int getNetSpacing(odb::dbTechLayer* layer, int width1, int width2);
    void incrementNumClocks() { ++numberOfClocks_; }
-@@ -214,6 +255,7 @@ class TritonCTS
+@@ -214,6 +262,7 @@ class TritonCTS
    utl::Logger* logger_ = nullptr;
    CtsOptions* options_ = nullptr;
    std::unique_ptr<TechChar> techChar_;
@@ -1998,10 +2005,10 @@ index 0000000000..543e31b1d3
 +}  // namespace cts
 diff --git a/src/cts/src/CtsSkewLpSolver.cpp b/src/cts/src/CtsSkewLpSolver.cpp
 new file mode 100644
-index 0000000000..b6e850359f
+index 0000000000..d36878d339
 --- /dev/null
 +++ b/src/cts/src/CtsSkewLpSolver.cpp
-@@ -0,0 +1,974 @@
+@@ -0,0 +1,1371 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -2010,10 +2017,24 @@ index 0000000000..b6e850359f
 +
 +#include "CtsSkewLpSolver.h"
 +
++#include <fcntl.h>
++#include <malloc.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
 +#include <algorithm>
 +#include <chrono>
 +#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
 +#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <memory>
++#include <string_view>
++#include <thread>
 +#include <fstream>
 +#include <iomanip>
 +#include <limits>
@@ -2044,6 +2065,290 @@ index 0000000000..b6e850359f
 +constexpr int CTS_LP_RESULT = 603;
 +constexpr int CTS_LP_TARGETS = 604;
 +constexpr int CTS_LP_IO = 605;
++
++namespace {
++
++// Contents of a file: mapped read-only, or read into memory when it cannot be
++// mapped.  Empty file = no bytes.
++class FileBytes
++{
++ public:
++  explicit FileBytes(const std::string& path)
++  {
++    fd_ = ::open(path.c_str(), O_RDONLY);
++    if (fd_ < 0) {
++      return;
++    }
++    ok_ = true;
++    struct stat st;
++    if (::fstat(fd_, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
++      void* p = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd_, 0);
++      if (p != MAP_FAILED) {
++        map_ = p;
++        size_ = static_cast<size_t>(st.st_size);
++        data_ = static_cast<const char*>(p);
++        ::madvise(p, size_, MADV_SEQUENTIAL);
++        return;
++      }
++    }
++    char buf[1 << 16];
++    ssize_t n;
++    while ((n = ::read(fd_, buf, sizeof(buf))) > 0) {
++      copy_.insert(copy_.end(), buf, buf + n);
++    }
++    data_ = copy_.data();
++    size_ = copy_.size();
++  }
++  ~FileBytes()
++  {
++    if (map_ != nullptr) {
++      ::munmap(map_, size_);
++    }
++    if (fd_ >= 0) {
++      ::close(fd_);
++    }
++  }
++  FileBytes(const FileBytes&) = delete;
++  FileBytes& operator=(const FileBytes&) = delete;
++  bool ok() const { return ok_; }
++  // true when data() is a read-only file mapping (pages can be dropped)
++  bool mapped() const { return map_ != nullptr; }
++  const char* data() const { return data_; }
++  size_t size() const { return size_; }
++
++ private:
++  int fd_ = -1;
++  bool ok_ = false;
++  void* map_ = nullptr;
++  const char* data_ = nullptr;
++  size_t size_ = 0;
++  std::vector<char> copy_;
++};
++
++// Next line of [p, end) with the semantics of std::getline(in, line): '\n'
++// separates lines, no CR handling, a last line without '\n' counts when it is
++// not empty.  Returns false at the end.
++bool nextLine(const char*& p, const char* end, std::string_view& line)
++{
++  if (p >= end) {
++    return false;
++  }
++  const void* nl = std::memchr(p, '\n', end - p);
++  const char* e = nl ? static_cast<const char*>(nl) : end;
++  line = std::string_view(p, e - p);
++  p = nl ? e + 1 : end;
++  return true;
++}
++
++// Fields of a line as repeated std::getline(ss, field, ',') returns them:
++// n commas give n + 1 pieces, and the last piece is dropped when it is empty
++// (getline extracts nothing there and fails).
++void splitGetlineFields(std::string_view line,
++                        std::vector<std::string_view>& out)
++{
++  out.clear();
++  size_t a = 0;
++  while (true) {
++    const size_t b = line.find(',', a);
++    if (b == std::string_view::npos) {
++      if (a < line.size()) {
++        out.push_back(line.substr(a));
++      }
++      return;
++    }
++    out.push_back(line.substr(a, b - a));
++    a = b + 1;
++  }
++}
++
++// "inf" marks an unmeasured corner and is kept as infinity (the register stays
++// in the LP universe, the corner yields no constraint).  Empty or NaN fields
++// read as 0.
++float safeStof(const std::string& s)
++{
++  if (s.empty()) {
++    return 0.0f;
++  }
++  if (s == "inf" || s == "INF") {
++    return std::numeric_limits<float>::infinity();
++  }
++  if (s == "-inf" || s == "-INF") {
++    return -std::numeric_limits<float>::infinity();
++  }
++  if (s == "nan" || s == "NAN") {
++    return 0.0f;
++  }
++  try {
++    return std::stof(s);
++  } catch (...) {
++    return 0.0f;
++  }
++}
++
++// One graph row of the LP (name ids of the part that read it).
++struct GraphRawEdge
++{
++  int from_id, to_id;
++  float slack_max, slack_min;
++  int from_tier, to_tier;
++};
++
++// Parse result of one byte range of the graph (whole lines).  Names get local
++// ids in the order of their first use; the merge maps them to global ids.
++struct GraphPart
++{
++  std::vector<std::string> names;
++  std::vector<GraphRawEdge> raw;
++  std::vector<int> hold_from, hold_to;
++  std::vector<double> hold;
++  long long lines = 0;
++  std::exception_ptr error;  // first exception of the range (std::stoi)
++};
++
++// Rows of [p, end): LP rows (>= 14 fields; std::stof slacks, std::stoi tiers)
++// and, with keep_hold, the hold-budget rows (capture name and slack_min
++// non-empty, std::stod(slack_min) succeeds).  Same conversions, same rules and
++// same row order as one sequential pass over the lines.
++// With release_pages ([p, end) lies in a read-only file mapping), the pages
++// already parsed are dropped from the resident set every 32 MB
++// (MADV_DONTNEED; a later access would read the file again), so the mapped
++// file does not add to the peak memory of the session.
++void parseGraphPart(const char* p,
++                    const char* end,
++                    bool keep_hold,
++                    bool release_pages,
++                    GraphPart& out)
++{
++  const uintptr_t page = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
++  auto page_floor = [page](const char* a) {
++    return reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(a) & ~(page - 1));
++  };
++  char* released = page_floor(p);
++  try {
++    // one allocation per output array (the line count bounds both row
++    // counts): no growth chain of freed blocks left in this thread's arena
++    size_t n_nl = 0;
++    char* counted = released;
++    for (const char* q = p; q < end;) {
++      const void* nl = std::memchr(q, '\n', end - q);
++      ++n_nl;
++      if (nl == nullptr) {
++        break;
++      }
++      q = static_cast<const char*>(nl) + 1;
++      if (release_pages && q - counted > (ptrdiff_t{32} << 20)) {
++        char* upto = page_floor(q);
++        ::madvise(counted, upto - counted, MADV_DONTNEED);
++        counted = upto;
++      }
++    }
++    out.raw.reserve(n_nl);
++    if (keep_hold) {
++      out.hold_from.reserve(n_nl);
++      out.hold_to.reserve(n_nl);
++      out.hold.reserve(n_nl);
++    }
++    std::unordered_map<std::string, int> name_id;
++    std::string key;
++    auto intern = [&](std::string_view s) -> int {
++      key.assign(s.data(), s.size());
++      auto it = name_id.find(key);
++      if (it != name_id.end()) {
++        return it->second;
++      }
++      const int id = static_cast<int>(out.names.size());
++      out.names.push_back(key);
++      name_id.emplace(key, id);
++      return id;
++    };
++    // rows of one launch register are consecutive: remember the last from_ff
++    std::string last_from;
++    int last_from_id = -1;
++    auto intern_from = [&](std::string_view s) -> int {
++      if (last_from_id < 0 || s != last_from) {
++        last_from.assign(s.data(), s.size());
++        last_from_id = intern(s);
++      }
++      return last_from_id;
++    };
++    std::vector<std::string_view> fields;
++    std::string tok;
++    std::string_view line;
++    while (nextLine(p, end, line)) {
++      if (release_pages && p - released > (ptrdiff_t{32} << 20)) {
++        char* upto = page_floor(line.data());
++        if (upto > released) {
++          ::madvise(released, upto - released, MADV_DONTNEED);
++          released = upto;
++        }
++      }
++      ++out.lines;
++      splitGetlineFields(line, fields);
++      const size_t nf = fields.size();
++      // hold-budget row (the line need not be a complete LP row)
++      if (keep_hold && nf > 3 && !fields[1].empty() && !fields[3].empty()) {
++        tok.assign(fields[3].data(), fields[3].size());
++        bool ok = true;
++        double hold = 0.0;
++        try {
++          hold = std::stod(tok);
++        } catch (...) {
++          ok = false;
++        }
++        if (ok) {
++          out.hold_from.push_back(intern_from(fields[0]));
++          out.hold_to.push_back(intern(fields[1]));
++          out.hold.push_back(hold);
++        }
++      }
++      if (line.empty() || nf < 14) {
++        continue;
++      }
++      GraphRawEdge e;
++      e.from_id = intern_from(fields[0]);
++      e.to_id = intern(fields[1]);
++      tok.assign(fields[2].data(), fields[2].size());
++      e.slack_max = safeStof(tok);
++      tok.assign(fields[3].data(), fields[3].size());
++      e.slack_min = safeStof(tok);
++      // arrival_max / arrival_min (fields 4, 5) are not used by the LP
++      tok.assign(fields[10].data(), fields[10].size());
++      e.from_tier = std::stoi(tok);
++      tok.assign(fields[13].data(), fields[13].size());
++      e.to_tier = std::stoi(tok);
++      out.raw.push_back(e);
++    }
++  } catch (...) {
++    out.error = std::current_exception();
++  }
++}
++
++bool sameFileState(const struct stat& a, const struct stat& b)
++{
++  return a.st_dev == b.st_dev && a.st_ino == b.st_ino
++         && a.st_size == b.st_size && a.st_mtim.tv_sec == b.st_mtim.tv_sec
++         && a.st_mtim.tv_nsec == b.st_mtim.tv_nsec;
++}
++
++// Hold-budget rows of the last graph read by the LP of this process.
++std::unique_ptr<LpGraphHoldRows> kept_hold_rows;
++struct stat kept_hold_stat;
++
++}  // namespace
++
++std::unique_ptr<LpGraphHoldRows> takeLpGraphHoldRows(
++    const std::string& csv_path)
++{
++  if (!kept_hold_rows) {
++    return nullptr;
++  }
++  struct stat st;
++  if (::stat(csv_path.c_str(), &st) != 0
++      || !sameFileState(st, kept_hold_stat)) {
++    return nullptr;
++  }
++  return std::move(kept_hold_rows);
++}
 +
 +CtsSkewLpSolver::CtsSkewLpSolver(odb::dbBlock* block,
 +                                 sta::dbSta* sta,
@@ -2118,111 +2423,210 @@ index 0000000000..b6e850359f
 +  // Header: from_ff,to_ff,slack_max_ns,slack_min_ns,arrival_max_ns,
 +  //         arrival_min_ns,required_max_ns,required_min_ns,from_x,from_y,
 +  //         from_tier,to_x,to_y,to_tier[,from_clock_net,to_clock_net]
-+  std::string header;
-+  std::getline(infile, header);
++  //
++  // The file (> 10 M rows on the largest case) is split into byte ranges of
++  // whole lines that are parsed in parallel and merged in file order.  Each
++  // line is split as std::getline(ss, field, ',') splits it and every value
++  // goes through the same std:: conversion as in a sequential pass (std::stof,
++  // std::stoi; std::stod for the hold-budget rows), so the LP input does not
++  // depend on the number of threads; register names are interned instead of
++  // being stored per row.
++  infile.close();
++  const auto t_parse0 = std::chrono::steady_clock::now();
++  struct stat st_graph;
++  const bool have_stat = ::stat(csv_path.c_str(), &st_graph) == 0;
 +
-+  struct RawEdge
++  // Hold-budget rows are kept for the delivery tree of this session when
++  // CTS_TIMING_GRAPH_CSV names this file (HTreeBuilder::loadTapHoldBudgets).
++  bool keep_hold = false;
++  if (const char* hb_csv = std::getenv("CTS_TIMING_GRAPH_CSV")) {
++    struct stat st_hb;
++    keep_hold = have_stat && ::stat(hb_csv, &st_hb) == 0
++                && st_hb.st_dev == st_graph.st_dev
++                && st_hb.st_ino == st_graph.st_ino;
++  }
++  kept_hold_rows.reset();
++
++  auto file = std::make_unique<FileBytes>(csv_path);
++  if (!file->ok()) {
++    logger_->error(utl::CTS,
++                   CTS_LP_START + 1,
++                   "Skew LP: cannot open timing graph CSV: {}",
++                   csv_path);
++    return;
++  }
++  const char* p = file->data();
++  const char* end = p + file->size();
++  std::string_view line;
++  nextLine(p, end, line);  // header
++
++  // byte ranges ending at a line end; at most NUM_CORES threads (cap 16), one
++  // range per 4 MB
++  int n_threads = 1;
++  if (const char* nc = std::getenv("NUM_CORES")) {
++    n_threads = std::max(1, std::min(16, std::atoi(nc)));
++  }
++  const size_t bytes = end - p;
++  const size_t n_parts = std::max<size_t>(
++      1, std::min<size_t>(n_threads, bytes / (size_t{4} << 20)));
++  std::vector<const char*> cut{p};
++  for (size_t k = 1; k < n_parts; ++k) {
++    const char* c = p + bytes * k / n_parts;
++    c = std::max(c, cut.back());
++    const void* nl = std::memchr(c, '\n', end - c);
++    cut.push_back(nl ? static_cast<const char*>(nl) + 1 : end);
++  }
++  cut.push_back(end);
++  std::vector<GraphPart> parts(n_parts);
++  if (n_parts == 1) {
++    parseGraphPart(cut[0], cut[1], keep_hold, file->mapped(), parts[0]);
++  } else {
++    std::vector<std::thread> pool;
++    for (size_t k = 0; k < n_parts; ++k) {
++      pool.emplace_back(parseGraphPart,
++                        cut[k],
++                        cut[k + 1],
++                        keep_hold,
++                        file->mapped(),
++                        std::ref(parts[k]));
++    }
++    for (auto& t : pool) {
++      t.join();
++    }
++  }
++  // a sequential pass would stop at the first failing line: rethrow the first
++  for (const auto& part : parts) {
++    if (part.error) {
++      std::rethrow_exception(part.error);
++    }
++  }
++  file.reset();  // unmap the file before the merge
++
++  // merge in file order: global name ids in order of first use; the part rows
++  // are mapped to global ids in place and then consumed part by part
++  std::vector<std::string> names;
++  long long n_lines = 0;
++  size_t n_raw = 0, n_hold = 0;
 +  {
-+    std::string from_ff, to_ff;
-+    float slack_max, slack_min, arrival_max, arrival_min;
-+    int from_tier, to_tier;
-+  };
-+  std::vector<RawEdge> raw_edges;
-+  std::unordered_set<std::string> ff_set;
-+
-+  // "inf" marks an unmeasured corner and is kept as infinity (the register
-+  // stays in the LP universe, the corner yields no constraint).  Empty or NaN
-+  // fields read as 0.
-+  auto safe_stof = [](const std::string& s) -> float {
-+    if (s.empty()) {
-+      return 0.0f;
++    std::unordered_map<std::string, int> name_id;
++    for (auto& part : parts) {
++      std::vector<int> gid(part.names.size());
++      for (size_t k = 0; k < part.names.size(); ++k) {
++        auto it = name_id.find(part.names[k]);
++        if (it == name_id.end()) {
++          it = name_id.emplace(part.names[k], static_cast<int>(names.size()))
++                   .first;
++          names.push_back(part.names[k]);
++        }
++        gid[k] = it->second;
++      }
++      for (GraphRawEdge& e : part.raw) {
++        e.from_id = gid[e.from_id];
++        e.to_id = gid[e.to_id];
++      }
++      for (size_t r = 0; r < part.hold.size(); ++r) {
++        part.hold_from[r] = gid[part.hold_from[r]];
++        part.hold_to[r] = gid[part.hold_to[r]];
++      }
++      std::vector<std::string>().swap(part.names);
++      n_raw += part.raw.size();
++      n_hold += part.hold.size();
++      n_lines += part.lines;
 +    }
-+    if (s == "inf" || s == "INF") {
-+      return std::numeric_limits<float>::infinity();
-+    }
-+    if (s == "-inf" || s == "-INF") {
-+      return -std::numeric_limits<float>::infinity();
-+    }
-+    if (s == "nan" || s == "NAN") {
-+      return 0.0f;
-+    }
-+    try {
-+      return std::stof(s);
-+    } catch (...) {
-+      return 0.0f;
-+    }
-+  };
-+
-+  std::string line;
-+  while (std::getline(infile, line)) {
-+    if (line.empty()) {
-+      continue;
-+    }
-+    std::istringstream ss(line);
-+    std::string token;
-+    std::vector<std::string> fields;
-+    while (std::getline(ss, token, ',')) {
-+      fields.push_back(token);
-+    }
-+    if (fields.size() < 14) {
-+      continue;
-+    }
-+    RawEdge e;
-+    e.from_ff = fields[0];
-+    e.to_ff = fields[1];
-+    e.slack_max = safe_stof(fields[2]);
-+    e.slack_min = safe_stof(fields[3]);
-+    e.arrival_max = safe_stof(fields[4]);
-+    e.arrival_min = safe_stof(fields[5]);
-+    e.from_tier = std::stoi(fields[10]);
-+    e.to_tier = std::stoi(fields[13]);
-+    raw_edges.push_back(e);
 +  }
 +
 +  // Every endpoint of every row (identity rows included) is an LP register.
 +  edges_.clear();
-+  for (const auto& e : raw_edges) {
-+    ff_set.insert(e.from_ff);
-+    ff_set.insert(e.to_ff);
++  std::vector<char> in_lp(names.size(), 0);
++  for (const auto& part : parts) {
++    for (const auto& e : part.raw) {
++      in_lp[e.from_id] = 1;
++      in_lp[e.to_id] = 1;
++    }
 +  }
-+
-+  ff_list_.assign(ff_set.begin(), ff_set.end());
++  ff_list_.clear();
++  for (size_t k = 0; k < names.size(); ++k) {
++    if (in_lp[k]) {
++      ff_list_.push_back(names[k]);
++    }
++  }
 +  std::sort(ff_list_.begin(), ff_list_.end());
 +  ff_to_idx_.clear();
 +  for (int i = 0; i < static_cast<int>(ff_list_.size()); ++i) {
 +    ff_to_idx_[ff_list_[i]] = i;
 +  }
++  std::vector<int> id_to_idx(names.size(), -1);
++  for (size_t k = 0; k < names.size(); ++k) {
++    if (in_lp[k]) {
++      id_to_idx[k] = ff_to_idx_.at(names[k]);
++    }
++  }
 +
 +  ff_tiers_.resize(ff_list_.size(), 0);
-+  for (const auto& e : raw_edges) {
-+    auto it = ff_to_idx_.find(e.from_ff);
-+    if (it != ff_to_idx_.end()) {
-+      ff_tiers_[it->second] = e.from_tier;
-+    }
-+    it = ff_to_idx_.find(e.to_ff);
-+    if (it != ff_to_idx_.end()) {
-+      ff_tiers_[it->second] = e.to_tier;
++  for (const auto& part : parts) {
++    for (const auto& e : part.raw) {
++      ff_tiers_[id_to_idx[e.from_id]] = e.from_tier;
++      ff_tiers_[id_to_idx[e.to_id]] = e.to_tier;
 +    }
 +  }
 +
 +  // One LP edge per row.  An infinite corner was never measured; only that
 +  // corner is skipped later (setup_ghost / hold_ghost), the other one is kept.
-+  for (const auto& e : raw_edges) {
-+    auto it_i = ff_to_idx_.find(e.from_ff);
-+    auto it_j = ff_to_idx_.find(e.to_ff);
-+    if (it_i == ff_to_idx_.end() || it_j == ff_to_idx_.end()) {
-+      continue;
-+    }
-+    LpTimingEdge le;
-+    le.from_idx = it_i->second;
-+    le.to_idx = it_j->second;
-+    le.slack_setup_ns = e.slack_max;
-+    le.slack_hold_ns = e.slack_min;
-+    le.cross_tier = (e.from_tier != e.to_tier);
-+    le.hold_ghost = !std::isfinite(e.slack_min);
-+    le.setup_ghost = !std::isfinite(e.slack_max);
-+    edges_.push_back(le);
++  edges_.reserve(n_raw);
++  auto hold_rows = keep_hold ? std::make_unique<LpGraphHoldRows>() : nullptr;
++  if (hold_rows) {
++    hold_rows->from_id.reserve(n_hold);
++    hold_rows->to_id.reserve(n_hold);
++    hold_rows->hold.reserve(n_hold);
 +  }
++  for (auto& part : parts) {
++    for (const auto& e : part.raw) {
++      LpTimingEdge le;
++      le.from_idx = id_to_idx[e.from_id];
++      le.to_idx = id_to_idx[e.to_id];
++      le.slack_setup_ns = e.slack_max;
++      le.slack_hold_ns = e.slack_min;
++      le.cross_tier = (e.from_tier != e.to_tier);
++      le.hold_ghost = !std::isfinite(e.slack_min);
++      le.setup_ghost = !std::isfinite(e.slack_max);
++      edges_.push_back(le);
++    }
++    if (hold_rows) {
++      hold_rows->from_id.insert(hold_rows->from_id.end(),
++                                part.hold_from.begin(),
++                                part.hold_from.end());
++      hold_rows->to_id.insert(
++          hold_rows->to_id.end(), part.hold_to.begin(), part.hold_to.end());
++      hold_rows->hold.insert(
++          hold_rows->hold.end(), part.hold.begin(), part.hold.end());
++    }
++    part = GraphPart();  // release the part
++  }
++  parts.clear();
++  // the parts were allocated by the parser threads: return their freed memory
++  // to the system before the LP model is built (no effect on results)
++  ::malloc_trim(0);
++
++  // Keep the hold rows only if the file did not change during the pass.
++  if (hold_rows) {
++    struct stat st_end;
++    if (::stat(csv_path.c_str(), &st_end) == 0
++        && sameFileState(st_end, st_graph)) {
++      hold_rows->names = std::move(names);
++      kept_hold_rows = std::move(hold_rows);
++      kept_hold_stat = st_graph;
++    }
++  }
++  logger_->info(utl::CTS,
++                2131,
++                "Skew LP: graph parsed in {:.1f}s ({} lines; hold-budget rows "
++                "kept for the delivery tree: {})",
++                std::chrono::duration<double>(std::chrono::steady_clock::now()
++                                              - t_parse0)
++                    .count(),
++                n_lines,
++                kept_hold_rows ? std::to_string(kept_hold_rows->hold.size())
++                               : std::string("no"));
 +
 +  logger_->info(utl::CTS,
 +                CTS_LP_EDGES,
@@ -2978,10 +3382,10 @@ index 0000000000..b6e850359f
 +}  // namespace cts
 diff --git a/src/cts/src/CtsSkewLpSolver.h b/src/cts/src/CtsSkewLpSolver.h
 new file mode 100644
-index 0000000000..f8226bd821
+index 0000000000..3d5b6cf8f4
 --- /dev/null
 +++ b/src/cts/src/CtsSkewLpSolver.h
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,187 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -3011,6 +3415,7 @@ index 0000000000..f8226bd821
 +
 +#pragma once
 +
++#include <memory>
 +#include <string>
 +#include <unordered_map>
 +#include <vector>
@@ -3057,6 +3462,31 @@ index 0000000000..f8226bd821
 +    PO_HOLD
 +  } type;
 +};
++
++// Hold-budget rows of the register graph CSV, kept by the LP reader for the
++// load-aware tap assignment (HTreeBuilder::loadTapHoldBudgets) of the same
++// process, so the delivery tree does not parse the graph a second time.  One
++// entry per CSV line that the hold-budget loader accepts (capture name and
++// slack_min field non-empty, std::stod of slack_min succeeded), in file order:
++//   hold = std::stod(slack_min field), exactly as the loader converts it.
++// Names are ids into `names` (columns from_ff / to_ff as the loader splits
++// the line with std::getline(ss, field, ',')).
++struct LpGraphHoldRows
++{
++  std::vector<std::string> names;
++  std::vector<int> from_id;
++  std::vector<int> to_id;
++  std::vector<double> hold;
++};
++
++// Hand over the rows kept by the last CtsSkewLpSolver::readTimingGraphCSV of
++// this process if they were read from `csv_path` (same file: device, inode,
++// size and modification time) and nothing changed since; nullptr otherwise
++// (the caller then parses the file).  The rows are released by the call.
++// The LP reader keeps them only when CTS_TIMING_GRAPH_CSV names the graph it
++// reads (the delivery session sets it).
++std::unique_ptr<LpGraphHoldRows> takeLpGraphHoldRows(
++    const std::string& csv_path);
 +
 +// Default WNS relaxation of phase B (W <= W* (1 + alpha)).
 +constexpr float kDefaultLpWnsAlpha = 0.05f;
@@ -4326,10 +4756,10 @@ index 0000000000..82d65f577f
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyClockReplay.cpp b/src/cts/src/EarlyClockReplay.cpp
 new file mode 100644
-index 0000000000..c44099ae27
+index 0000000000..bc0481056c
 --- /dev/null
 +++ b/src/cts/src/EarlyClockReplay.cpp
-@@ -0,0 +1,894 @@
+@@ -0,0 +1,901 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -5043,7 +5473,14 @@ index 0000000000..c44099ae27
 +  return acc;
 +}
 +
-+std::vector<double> HBT::full_delta(const std::vector<Group>& groups, const std::vector<std::pair<std::string, int>>& geo_leaves)
++const std::vector<std::string>& HBT::loads_of(const std::string& net) const
++{
++  static const std::vector<std::string> none;
++  auto it = net_loads_.find(net);
++  return it == net_loads_.end() ? none : it->second;
++}
++
++std::vector<double> HBT::full_delta(const std::vector<Group>& groups, const std::vector<std::pair<std::string, int>>& geo_leaves) const
 +{
 +  std::vector<double> out(P_, 0.0);
 +  std::set<int> tiers;
@@ -5065,11 +5502,11 @@ index 0000000000..c44099ae27
 +  for (int i : moved) { auto pt = path_.find(i); if (pt != path_.end()) rm_add(pt->second.back().first, pt->second.back().second); }
 +  for (auto& gl : geo_leaves) {
 +    auto ip = in_pin_.find(gl.first);
-+    if (ip != in_pin_.end() && pin_net_.count(ip->second)) rm_add(pin_net_[ip->second], ip->second);
++    if (ip != in_pin_.end() && pin_net_.count(ip->second)) rm_add(pin_net_.at(ip->second), ip->second);
 +  }
 +  for (auto& net : rm_order) {
 +    std::vector<std::string> keep;
-+    for (auto& p : net_loads_[net]) if (!rm[net].count(p)) keep.push_back(p);
++    for (auto& p : loads_of(net)) if (!rm[net].count(p)) keep.push_back(p);
 +    bool ok;
 +    int td = drv_tier(net, ok);
 +    if (!new_local.count(net)) nl_order.push_back(net);
@@ -5079,7 +5516,7 @@ index 0000000000..c44099ae27
 +  for (auto& net : nl_order) {
 +    const Local& nl = new_local[net];
 +    auto oldit = ref_local_.find(net);
-+    for (auto& p : net_loads_[net]) {
++    for (auto& p : loads_of(net)) {
 +      double nv = nl.count(p) ? nl.at(p) : 0.0;
 +      double ov = (oldit != ref_local_.end() && oldit->second.count(p)) ? oldit->second.at(p) : 0.0;
 +      double dd = nv - ov;
@@ -5226,10 +5663,10 @@ index 0000000000..c44099ae27
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyClockReplay.h b/src/cts/src/EarlyClockReplay.h
 new file mode 100644
-index 0000000000..4d3431af7d
+index 0000000000..4b2a2528b8
 --- /dev/null
 +++ b/src/cts/src/EarlyClockReplay.h
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,212 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -5389,8 +5826,8 @@ index 0000000000..4d3431af7d
 +  // members mem on a new tier-t leaf at (cx, cy) under the tier-t hub; hub_tiers share the entry net
 +  std::vector<double> member_delta(const std::vector<int>& mem, int t, long long cx, long long cy, const std::set<int>& hub_tiers) const;
 +  struct Group { std::vector<int> mem; int tier; long long cx, cy; };
-+  // whole-plan correction (length P)
-+  std::vector<double> full_delta(const std::vector<Group>& groups, const std::vector<std::pair<std::string, int>>& geo_leaves);
++  // whole-plan correction (length P); const and lookup-only, so concurrent calls on one HBT are safe (hub generation)
++  std::vector<double> full_delta(const std::vector<Group>& groups, const std::vector<std::pair<std::string, int>>& geo_leaves) const;
 +
 + private:
 +  using Local = std::map<std::string, double>;   // key -> delay (insertion order irrelevant: lookups only)
@@ -5404,6 +5841,8 @@ index 0000000000..4d3431af7d
 +  Local entry_local(const std::set<int>& tiers) const;
 +  Local new_leaf_local(const std::vector<int>& mem, int t, long long cx, long long cy) const;
 +  double below(int i, const std::string& p) const;
++  // loads of a net in dump order (empty for an unknown net; never inserts)
++  const std::vector<std::string>& loads_of(const std::string& net) const;
 +
 +  double R_;
 +  std::vector<std::string> pins_;
@@ -5478,10 +5917,10 @@ index 0000000000..2257d01ca1
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyHub.cpp b/src/cts/src/EarlyHub.cpp
 new file mode 100644
-index 0000000000..88c3caf4e6
+index 0000000000..7513620f0c
 --- /dev/null
 +++ b/src/cts/src/EarlyHub.cpp
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,433 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -5495,7 +5934,11 @@ index 0000000000..88c3caf4e6
 +#include <chrono>
 +#include <cmath>
 +#include <cstdio>
++#include <cstdlib>
++#include <exception>
 +#include <memory>
++#include <functional>
++#include <mutex>
 +#include <numeric>
 +#include <thread>
 +
@@ -5529,7 +5972,7 @@ index 0000000000..88c3caf4e6
 +}
 +
 +// per-register hybrid-bond correction (length P) of one candidate
-+std::vector<double> hbt_cand(const Replay& R, HBT& H, const std::string& fam, const std::vector<int>& m, int t, const std::string& leaf)
++std::vector<double> hbt_cand(const Replay& R, const HBT& H, const std::string& fam, const std::vector<int>& m, int t, const std::string& leaf)
 +{
 +  if (fam == "F1") return H.full_delta({}, {{leaf, t}});
 +  std::vector<double> xs, ys;
@@ -5613,6 +6056,7 @@ index 0000000000..88c3caf4e6
 +  auto T0 = std::chrono::steady_clock::now();
 +  mkdirs(join_path(out, "cands"));
 +  Setup S = setup(plat, des, view, dump, calib_dir, hbt_nets, setrc);
++  auto Ts = std::chrono::steady_clock::now();
 +  Replay& R = S.R;
 +  HBT& H = *S.H;
 +  // measured n=1 shifts per tier vs root distance (calibration points)
@@ -5635,48 +6079,67 @@ index 0000000000..88c3caf4e6
 +  int P = R.P, G = R.G;
 +  std::vector<double> dist(P);
 +  for (int i = 0; i < P; ++i) dist[i] = (std::fabs(R.X[i] - (double) R.rx) + std::fabs(R.Y[i] - (double) R.ry)) / 1000.0;
-+  // per-register construction gains in parallel slots (result independent of the thread count)
-+  std::vector<double> single(P, -INFINITY);
-+  {
-+    const int nth = std::max(1, early_threads());
-+    std::atomic<long> calls{0};
-+    auto work = [&](int th) {
-+      long c = 0;
-+      for (int i = th; i < P; i += nth) {
-+        int t = R.chosen[R.memb0[i]];
-+        bool ok;
-+        double dl = delta(t, dist[i], ok);
-+        if (!ok) continue;
-+        double hx = H.member_delta({i}, t, py_int(R.X[i]), py_int(R.Y[i]), {t})[0];
-+        single[i] = R.cgain_quiet({i}, {dl - R.tgt[i] + hx}).first;
-+        ++c;
++  // Worker threads of the two parallel loops below: EARLY_HUB_THREADS (the flow passes the case thread budget THREADS),
++  // else NUM_CORES of the decision session (early_threads()).  Both loops write every result into a slot of its own
++  // index and read only const data, so the output does not depend on the thread count.
++  int nth = early_threads();
++  if (const char* e = std::getenv("EARLY_HUB_THREADS")) { int n = std::atoi(e); if (n > 0) nth = n; }
++  nth = std::max(1, nth);
++  // run work(index) for index 0..n-1 on nth threads (dynamic claim of the next index); rethrows the first error
++  auto parallel_for = [nth](int n, const std::function<void(int)>& work) {
++    std::atomic<int> next{0};
++    std::exception_ptr err;
++    std::mutex mu;
++    auto run = [&]() {
++      for (int i = next++; i < n; i = next++) {
++        try { work(i); } catch (...) { std::lock_guard<std::mutex> l(mu); if (!err) err = std::current_exception(); next = n; }
 +      }
-+      calls += c;
 +    };
 +    std::vector<std::thread> pool;
-+    for (int th = 1; th < nth; ++th) pool.emplace_back(work, th);
-+    work(0);
++    for (int th = 1; th < std::min(nth, n); ++th) pool.emplace_back(run);
++    run();
 +    for (auto& th : pool) th.join();
-+    R.NCG += calls;
-+  }
++    if (err) std::rethrow_exception(err);
++  };
++  // per-register construction gains (result independent of the thread count)
++  auto T1 = std::chrono::steady_clock::now();
++  std::vector<double> single(P, -INFINITY);
++  std::vector<char> single_called(P, 0);
++  parallel_for(P, [&](int i) {
++    int t = R.chosen[R.memb0[i]];
++    bool ok;
++    double dl = delta(t, dist[i], ok);
++    if (!ok) return;
++    double hx = H.member_delta({i}, t, py_int(R.X[i]), py_int(R.Y[i]), {t})[0];
++    single[i] = R.cgain_quiet({i}, {dl - R.tgt[i] + hx}).first;
++    single_called[i] = 1;
++  });
++  for (int i = 0; i < P; ++i) R.NCG += single_called[i];
++  auto T2 = std::chrono::steady_clock::now();
++  // members of every stock group in register order (one pass instead of one scan of all registers per group)
++  std::vector<std::vector<int>> members(G);
++  for (int i = 0; i < P; ++i) if (R.memb0[i] >= 0 && R.memb0[i] < G) members[R.memb0[i]].push_back(i);
++  // per-group candidates F1 (whole stock group) and F2 (its members with a single gain > MIN_GAIN), evaluated in
++  // parallel into per-group slots and concatenated in group order (the order of a serial loop)
 +  struct Row { std::string fam; int k; std::vector<int> m; int t; double gain; bool ok; double dl; };
-+  std::vector<Row> rows;
-+  for (int k = 0; k < G; ++k) {
-+    std::vector<int> m;
-+    for (int i = 0; i < P; ++i) if (R.memb0[i] == k) m.push_back(i);
++  std::vector<std::vector<Row>> slots(G);
++  std::vector<int> slot_calls(G, 0);
++  parallel_for(G, [&](int k) {
++    const std::vector<int>& m = members[k];
 +    int t = R.chosen[k];
 +    std::vector<double> xs, ys;
 +    for (int i : m) { xs.push_back(R.X[i]); ys.push_back(R.Y[i]); }
 +    double cx = np_mean(xs), cy = np_mean(ys);
 +    bool ok;
 +    double dl = delta(t, (std::fabs(cx - (double) R.rx) + std::fabs(cy - (double) R.ry)) / 1000.0, ok);
-+    if (!ok) continue;
++    if (!ok) return;
 +    {
 +      auto hb = hbt_cand(R, H, "F1", m, t, R.sk.at(R.pins[m[0]]).driver);
 +      std::vector<double> x;
 +      for (int i : m) x.push_back(dl - R.tgt[i] + hb[i]);
-+      auto g = R.cgain(m, x);
-+      rows.push_back({"F1", k, m, t, g.first, g.second, dl});
++      auto g = R.cgain_quiet(m, x);
++      ++slot_calls[k];
++      slots[k].push_back({"F1", k, m, t, g.first, g.second, dl});
 +    }
 +    std::vector<int> s;
 +    for (int i : m) if (single[i] > MIN_GAIN) s.push_back(i);
@@ -5688,10 +6151,14 @@ index 0000000000..88c3caf4e6
 +      auto hb = hbt_cand(R, H, "F2", s, t, "");
 +      std::vector<double> x;
 +      for (int i : s) x.push_back(dl2 - R.tgt[i] + hb[i]);
-+      auto g = R.cgain(s, x);
-+      rows.push_back({"F2", k, s, t, g.first, g.second, dl2});
++      auto g = R.cgain_quiet(s, x);
++      ++slot_calls[k];
++      slots[k].push_back({"F2", k, s, t, g.first, g.second, dl2});
 +    }
-+  }
++  });
++  std::vector<Row> rows;
++  for (int k = 0; k < G; ++k) { R.NCG += slot_calls[k]; for (auto& r : slots[k]) rows.push_back(std::move(r)); }
++  auto T3 = std::chrono::steady_clock::now();
 +  std::vector<const Row*> sel;
 +  for (const char* fam : {"F1", "F2"}) {
 +    std::vector<const Row*> f;
@@ -5729,6 +6196,13 @@ index 0000000000..88c3caf4e6
 +  base.set("st", J::D(R.b_st)); base.set("sw", J::D(R.b_sw)); base.set("ht", J::D(R.b_ht)); base.set("hw", J::D(R.b_hw));
 +  j.set("base", base);
 +  write_text(join_path(out, "gen.json"), j.dump(1));
++  auto T4 = std::chrono::steady_clock::now();
++  // step timers (log only; gen.json is unchanged)
++  std::printf("hub generate timers: load (replay view, graph, HBT) %.1fs, setup %.1fs, per-register gains %.1fs (%d registers), per-group candidates %.1fs (%d groups), "
++              "ranking + output %.1fs, threads %d\n",
++              std::chrono::duration<double>(Ts - T0).count(), std::chrono::duration<double>(T1 - Ts).count(),
++              std::chrono::duration<double>(T2 - T1).count(), P, std::chrono::duration<double>(T3 - T2).count(), G,
++              std::chrono::duration<double>(T4 - T3).count(), nth);
 +  std::printf("hub candidates %s ranked %zu candidates %zu %.1fs\n", cas.c_str(), rows.size(), sel.size(), secs);
 +}
 +
@@ -6602,10 +7076,10 @@ index 0000000000..d558d4e477
 +
 +}  // namespace cts::early
 diff --git a/src/cts/src/HTreeBuilder.cpp b/src/cts/src/HTreeBuilder.cpp
-index 19710ceb81..5131e13707 100644
+index 19710ceb81..159dff2c67 100644
 --- a/src/cts/src/HTreeBuilder.cpp
 +++ b/src/cts/src/HTreeBuilder.cpp
-@@ -3,16 +3,27 @@
+@@ -3,16 +3,28 @@
  
  #include "HTreeBuilder.h"
  
@@ -6630,10 +7104,11 @@ index 19710ceb81..5131e13707 100644
  
  #include "Clustering.h"
 +#include "Cts3DDatabase.h"
++#include "CtsSkewLpSolver.h"
  #include "SinkClustering.h"
  #include "TechChar.h"
  #include "TreeBuilder.h"
-@@ -25,6 +36,88 @@ namespace cts {
+@@ -25,6 +37,88 @@ namespace cts {
  
  using utl::CTS;
  
@@ -6722,7 +7197,7 @@ index 19710ceb81..5131e13707 100644
  Point<double> HTreeBuilder::legalizeOneBuffer(Point<double> bufferLoc,
                                                const std::string& bufferName)
  {
-@@ -54,8 +147,9 @@ void HTreeBuilder::preSinkClustering(
+@@ -54,8 +148,9 @@ void HTreeBuilder::preSinkClustering(
    const std::vector<std::pair<float, float>>& points = sinks;
    if (!secondLevel) {
      clock_.forEachSink([&](ClockInst& inst) {
@@ -6734,7 +7209,7 @@ index 19710ceb81..5131e13707 100644
        mapLocationToSink_[normLocation] = &inst;
        if (!fuzzyEqual(inst.getInsertionDelay(), 0.0, 1e-6)) {
          setSinkInsertionDelay(normLocation,
-@@ -172,84 +266,219 @@ void HTreeBuilder::preSinkClustering(
+@@ -172,84 +267,219 @@ void HTreeBuilder::preSinkClustering(
          std::round(bestDiameter / options_->getDbUnits() * wireSegmentUnit_));
    }
  
@@ -7011,7 +7486,7 @@ index 19710ceb81..5131e13707 100644
    topLevelSinksClustered_ = std::move(newSinkLocations);
    if (clusterCount) {
      treeBufLevels_++;
-@@ -259,6 +488,37 @@ void HTreeBuilder::preSinkClustering(
+@@ -259,6 +489,37 @@ void HTreeBuilder::preSinkClustering(
                  19,
                  " Total number of sinks after clustering: {}.",
                  topLevelSinksClustered_.size());
@@ -7049,7 +7524,7 @@ index 19710ceb81..5131e13707 100644
  }
  
  Point<double> HTreeBuilder::resolveLocationCollision(
-@@ -269,11 +529,7 @@ Point<double> HTreeBuilder::resolveLocationCollision(
+@@ -269,11 +530,7 @@ Point<double> HTreeBuilder::resolveLocationCollision(
    // Collision check and jittering to ensure unique coordinates
    unsigned jitterCount = 0;
    while (true) {
@@ -7062,7 +7537,7 @@ index 19710ceb81..5131e13707 100644
      if (mapLocationToSink_.find(checkKey) == mapLocationToSink_.end()) {
        break;
      }
-@@ -352,6 +608,21 @@ void HTreeBuilder::initSinkRegion()
+@@ -352,6 +609,21 @@ void HTreeBuilder::initSinkRegion()
               wireSegmentUnit_);
    // clang-format on
  
@@ -7084,7 +7559,7 @@ index 19710ceb81..5131e13707 100644
    preSinkClustering(topLevelSinks, sinkInsts, maxDiameter, clusterSize);
    if (topLevelSinks.size() <= min_clustering_sinks
        || !(options_->getSinkClustering())) {
-@@ -1265,9 +1536,60 @@ void HTreeBuilder::run()
+@@ -1265,9 +1537,60 @@ void HTreeBuilder::run()
    numMaxLeafSinks_ = options_->getNumMaxLeafSinks();
    minLengthSinkRegion_ = techChar_->getMinSegmentLength() * 2;
  
@@ -7127,7 +7602,8 @@ index 19710ceb81..5131e13707 100644
 +      }
 +    }
 +  }
-+
+ 
+-  for (int level = 1; level <= clockTreeMaxDepth_; ++level) {
 +  // Depth limit of a macro tree that is not built flat.
 +  int effectiveMaxDepth = clockTreeMaxDepth_;
 +  if (type_ == TreeType::MacroTree && kMacroTreeMaxDepth < effectiveMaxDepth) {
@@ -7139,14 +7615,13 @@ index 19710ceb81..5131e13707 100644
 +                  clock_.getNumSinks());
 +    effectiveMaxDepth = kMacroTreeMaxDepth;
 +  }
- 
--  for (int level = 1; level <= clockTreeMaxDepth_; ++level) {
++
 +  auto prof_htree_t0 = std::chrono::high_resolution_clock::now();
 +  for (int level = 1; level <= effectiveMaxDepth; ++level) {
      const unsigned numSinksPerSubRegion
          = computeNumberOfSinksPerSubRegion(level);
      double regionWidth, regionHeight;
-@@ -1300,6 +1622,15 @@ void HTreeBuilder::run()
+@@ -1300,6 +1623,15 @@ void HTreeBuilder::run()
      }
    }
  
@@ -7162,7 +7637,7 @@ index 19710ceb81..5131e13707 100644
    if (topologyForEachLevel_.empty()) {
      createSingleBufferClockNet();
      treeBufLevels_++;
-@@ -1320,7 +1651,32 @@ void HTreeBuilder::run()
+@@ -1320,7 +1652,32 @@ void HTreeBuilder::run()
    if (options_->getObstructionAware()) {
      legalize();
    }
@@ -7195,7 +7670,7 @@ index 19710ceb81..5131e13707 100644
    // clang-format off
    debugPrint(logger_, CTS, "legalizer", 3, "Htree file {} has been generated",
               plotHTree());
-@@ -1329,6 +1685,50 @@ void HTreeBuilder::run()
+@@ -1329,6 +1686,50 @@ void HTreeBuilder::run()
    // clang-format on
  }
  
@@ -7246,7 +7721,7 @@ index 19710ceb81..5131e13707 100644
  bool HTreeBuilder::isNumberOfSinksTooSmall(unsigned numSinksPerSubRegion) const
  {
    if (options_->getMaxFanout()) {
-@@ -1830,8 +2230,9 @@ void HTreeBuilder::initTopLevelSinks(
+@@ -1830,8 +2231,9 @@ void HTreeBuilder::initTopLevelSinks(
  {
    sinkLocations.clear();
    clock_.forEachSink([&](const ClockInst& sink) {
@@ -7258,7 +7733,7 @@ index 19710ceb81..5131e13707 100644
      sinkInsts.emplace_back(&sink);
    });
  }
-@@ -1890,8 +2291,10 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
+@@ -1890,8 +2292,10 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
      branchPt2 = Point<double>(means[1].first, means[1].second);
    }
  
@@ -7269,7 +7744,7 @@ index 19710ceb81..5131e13707 100644
    unsigned movedSinks = 0;
    const double errorFactor = 1.2;
    for (int clusterIdx = 0; clusterIdx < clusters.size(); ++clusterIdx) {
-@@ -1927,18 +2330,137 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
+@@ -1927,18 +2331,174 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
    }
  }
  
@@ -7280,41 +7755,78 @@ index 19710ceb81..5131e13707 100644
 +void HTreeBuilder::loadTapHoldBudgets(const std::string& timingGraphCsv)
 +{
 +  tapHoldBudget_.clear();
-+  std::ifstream file(timingGraphCsv);
-+  if (!file.is_open()) {
-+    logger_->warn(CTS,
-+                  422,
-+                  "Cannot open timing graph for hold budgets: {}",
-+                  timingGraphCsv);
-+    return;
-+  }
-+
-+  std::string line;
-+  std::getline(file, line);  // skip header
-+
 +  int edgeCount = 0;
-+  while (std::getline(file, line)) {
-+    std::istringstream ss(line);
-+    std::string from_ff, to_ff, slack_max_str, slack_min_str;
-+    std::getline(ss, from_ff, ',');
-+    std::getline(ss, to_ff, ',');
-+    std::getline(ss, slack_max_str, ',');
-+    std::getline(ss, slack_min_str, ',');
 +
-+    if (to_ff.empty() || slack_min_str.empty()) {
-+      continue;
++  // Same graph already read by the skew LP of this session: use its rows
++  // (same lines, same std::stod values) instead of parsing the file again.
++  // Result and insertion order of tapHoldBudget_ are those of the file loop
++  // below: a capture register enters the map at its first row, later rows only
++  // lower the value (b < current).
++  if (auto rows = takeLpGraphHoldRows(timingGraphCsv)) {
++    const size_t n = rows->names.size();
++    std::vector<double> target(n);
++    for (size_t k = 0; k < n; ++k) {
++      target[k] = cts3dDb_->getSkewTarget(rows->names[k]);
++    }
++    std::vector<double> best(n, 0.0);
++    std::vector<char> seen(n, 0);
++    std::vector<int> order;
++    for (size_t r = 0; r < rows->hold.size(); ++r) {
++      const double b = rows->hold[r] + target[rows->from_id[r]];
++      const int t = rows->to_id[r];
++      if (!seen[t]) {
++        seen[t] = 1;
++        best[t] = b;
++        order.push_back(t);
++      } else if (b < best[t]) {
++        best[t] = b;
++      }
++    }
++    for (const int t : order) {
++      tapHoldBudget_[rows->names[t]] = best[t];
++    }
++    edgeCount = static_cast<int>(rows->hold.size());
++    logger_->info(CTS,
++                  2132,
++                  "Hold budgets: timing-graph rows of the skew LP reader "
++                  "reused (no second parse of {})",
++                  timingGraphCsv);
++  } else {
++    std::ifstream file(timingGraphCsv);
++    if (!file.is_open()) {
++      logger_->warn(CTS,
++                    422,
++                    "Cannot open timing graph for hold budgets: {}",
++                    timingGraphCsv);
++      return;
 +    }
 +
-+    try {
-+      const double holdSlack = std::stod(slack_min_str);
-+      const double b = holdSlack + cts3dDb_->getSkewTarget(from_ff);
-+      auto vt = tapHoldBudget_.find(to_ff);
-+      if (vt == tapHoldBudget_.end() || b < vt->second) {
-+        tapHoldBudget_[to_ff] = b;
++    std::string line;
++    std::getline(file, line);  // skip header
++
++    while (std::getline(file, line)) {
++      std::istringstream ss(line);
++      std::string from_ff, to_ff, slack_max_str, slack_min_str;
++      std::getline(ss, from_ff, ',');
++      std::getline(ss, to_ff, ',');
++      std::getline(ss, slack_max_str, ',');
++      std::getline(ss, slack_min_str, ',');
++
++      if (to_ff.empty() || slack_min_str.empty()) {
++        continue;
 +      }
-+      ++edgeCount;
-+    } catch (...) {
-+      // skip malformed lines
++
++      try {
++        const double holdSlack = std::stod(slack_min_str);
++        const double b = holdSlack + cts3dDb_->getSkewTarget(from_ff);
++        auto vt = tapHoldBudget_.find(to_ff);
++        if (vt == tapHoldBudget_.end() || b < vt->second) {
++          tapHoldBudget_[to_ff] = b;
++        }
++        ++edgeCount;
++      } catch (...) {
++        // skip malformed lines
++      }
 +    }
 +  }
 +
@@ -7411,7 +7923,7 @@ index 19710ceb81..5131e13707 100644
  
    if (topBufferName_.empty()) {
      topBufferName_ = rootBuffer.getName();
-@@ -1970,13 +2492,47 @@ void HTreeBuilder::createClockSubNets()
+@@ -1970,13 +2530,47 @@ void HTreeBuilder::createClockSubNets()
      if (topLevelTopology.getBranchSinksLocations(idx).empty()) {
        return;
      }
@@ -7461,7 +7973,7 @@ index 19710ceb81..5131e13707 100644
  		 "createClockSubNets level 1 clk_buf_1_{}_ : {} => {}",
  		 std::to_string(idx), branchPoint, legalBranchPoint);
      } else {
-@@ -1996,14 +2552,18 @@ void HTreeBuilder::createClockSubNets()
+@@ -1996,14 +2590,18 @@ void HTreeBuilder::createClockSubNets()
                             rootClockSubNet,
                             *techChar_,
                             wireSegmentUnit_,
@@ -7483,7 +7995,7 @@ index 19710ceb81..5131e13707 100644
      }
      if (isFirstPoint) {
        treeBufLevels_ += builder.getNumBufferLevels();
-@@ -2027,8 +2587,48 @@ void HTreeBuilder::createClockSubNets()
+@@ -2027,8 +2625,48 @@ void HTreeBuilder::createClockSubNets()
        LevelTopology& parentTopology = topologyForEachLevel_[levelIdx - 1];
        Point<double> parentPoint = parentTopology.getBranchingPoint(parentIdx);
  
@@ -7533,7 +8045,7 @@ index 19710ceb81..5131e13707 100644
        commitMoveLoc(branchPoint, legalBranchPoint);
  
        // clang-format off
-@@ -2056,7 +2656,9 @@ void HTreeBuilder::createClockSubNets()
+@@ -2056,7 +2694,9 @@ void HTreeBuilder::createClockSubNets()
                               *parentTopology.getBranchDrivingSubNet(parentIdx),
                               *techChar_,
                               wireSegmentUnit_,
@@ -7544,7 +8056,7 @@ index 19710ceb81..5131e13707 100644
  
        // Set clock tree level the first time only.
        if (builder.getDrivingSubNet()->getTreeLevel() < 0) {
-@@ -2064,12 +2666,14 @@ void HTreeBuilder::createClockSubNets()
+@@ -2064,12 +2704,14 @@ void HTreeBuilder::createClockSubNets()
        }
  
        if (!options_->getTreeBuffer().empty()) {
@@ -7561,7 +8073,7 @@ index 19710ceb81..5131e13707 100644
        }
        if (isFirstPoint) {
          treeBufLevels_ += builder.getNumBufferLevels();
-@@ -2081,30 +2685,762 @@ void HTreeBuilder::createClockSubNets()
+@@ -2081,30 +2723,762 @@ void HTreeBuilder::createClockSubNets()
  
    LevelTopology& leafTopology = topologyForEachLevel_.back();
    unsigned numSinks = 0;
@@ -7605,10 +8117,10 @@ index 19710ceb81..5131e13707 100644
 +        if (target > 0.0) {
 +          depth = static_cast<int>(std::round(target / tapStageDelay_));
 +          depth = std::max(0, std::min(depth, tapMaxDepth_));
-         }
++        }
 +        if (isMacroBlockInst(ff->getDbInst())) {
 +          depth = 0;
-+        }
+         }
 +        return depth;
 +      };
 +
@@ -7754,7 +8266,7 @@ index 19710ceb81..5131e13707 100644
 +                       "delay taps (unclustered): '{}' target={:.4f}ns",
 +                       ffName,
 +                       ffTarget);
-+          }
+           }
 +          int depth = tapDepth(sinkInst, ffTarget);
 +          if (depth == 0) {
 +            subNet->addInst(*sinkInst);
@@ -7841,7 +8353,7 @@ index 19710ceb81..5131e13707 100644
 +            cur->setLeafLevel(true);
 +            cur->addInst(*sinkInst);
 +            ++branchTappedFFs;
-           }
++          }
 +        }
 +        ++numSinks;
 +      }
@@ -8340,7 +8852,7 @@ index 19710ceb81..5131e13707 100644
  }
  
  void HTreeBuilder::createSingleBufferClockNet()
-@@ -2242,7 +3578,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
+@@ -2242,7 +3616,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
                                 ClockSubNet& drivingSubNet,
                                 const TechChar& techChar,
                                 const unsigned techCharDistUnit,
@@ -8351,7 +8863,7 @@ index 19710ceb81..5131e13707 100644
      : instPrefix_(instPrefix),
        netPrefix_(netPrefix),
        root_(root),
-@@ -2252,7 +3590,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
+@@ -2252,7 +3628,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
        techCharDistUnit_(techCharDistUnit),
        clock_(&clock),
        drivingSubNet_(&drivingSubNet),
@@ -8362,7 +8874,7 @@ index 19710ceb81..5131e13707 100644
  {
  }
  
-@@ -2286,15 +3626,19 @@ void SegmentBuilder::build(const std::string& forceBuffer)
+@@ -2286,15 +3664,19 @@ void SegmentBuilder::build(const std::string& forceBuffer)
        const std::string buffMaster = !forceBuffer.empty()
                                           ? forceBuffer
                                           : wireSegment.getBufferMaster(buffer);
@@ -8384,7 +8896,7 @@ index 19710ceb81..5131e13707 100644
  
        // clang-format off
        if (bufferLoc != legalBufferLoc) {
-@@ -2332,11 +3676,15 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
+@@ -2332,11 +3714,15 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
      return;
    }
  
@@ -8401,7 +8913,7 @@ index 19710ceb81..5131e13707 100644
    tree_->addTreeLevelBuffer(&newBuffer);
    // clang-format off
    debugPrint(getTree()->getLogger(), CTS, "legalizer", 2,
-@@ -2349,4 +3697,497 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
+@@ -2349,4 +3735,497 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
    numBufferLevels_++;
  }
  
@@ -9862,10 +10374,10 @@ index 0000000000..d9eba4fd27
 +}  // namespace cts
 diff --git a/src/cts/src/StagePredictor.cpp b/src/cts/src/StagePredictor.cpp
 new file mode 100644
-index 0000000000..f3ade16958
+index 0000000000..2d678205ec
 --- /dev/null
 +++ b/src/cts/src/StagePredictor.cpp
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,357 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -9883,6 +10395,35 @@ index 0000000000..f3ade16958
 +// sta_ps,slew_pred_ps,slew_sta_ps,base_ps,gates_ps,wires_ps,pin_cap_ff,
 +// wire_cap_ff,direct_loads for every register clock pin and every pin of a
 +// clkbuf* instance; <path>.boundaries.csv: the boundary seeds used.
++//
++// Fast candidate pass of the decision probes (early_probe.tcl).  The slow probe
++// of one candidate is: whole-design placement parasitics,
++// a "live" pass without frozen boundaries (its first STA arrival query forces a
++// whole-design delay calculation and arrival search) whose only kept output is
++// the boundary seed of the loads of the clock-source-port nets, and a second pass
++// with those seeds merged into the frozen boundaries.  The fast pass gives the
++// same seeds and the same predicted arrivals with:
++//   * runProbeFastInit (cts::probe_fast_init, once, unedited tree, complete STA):
++//     records the clock source port arrivals (they depend on the SDC clock only,
++//     not on the clock network), proves on every load of every clock source port
++//     net that port arrival + derated wire-arc delay (the clock-tag formula of
++//     OpenSTA's PathVisitor::visitFromPath, float arithmetic) equals
++//     Sta::pinArrival bit for bit (error otherwise), and enables incremental
++//     placement parasitics (est's ODB callbacks mark the nets the plan edits).
++//     Fail-closed: when any value differs (or no port load exists) it returns
++//     false, enables nothing, and the probe keeps the whole-design path.
++//   * candidate pass (CTS_STAGE_PORT_SEED_PINS = file of the port-load pins of the
++//     edited netlist): est->updateParasitics() for the edited nets; boundaries
++//     from CTS_STAGE_BOUNDARY_CSV except the listed port loads, whose slew is
++//     Sta::vertexSlew (level-limited delay calculation of the port net) and whose
++//     arrival is the formula above; CTS_STAGE_ARR_CSV = the register clock pin
++//     rows (rise edge: pin,mode,pred_ps; the text the Tcl filter writes from the
++//     row file); CTS_STAGE_NO_ROWS=1 = no row file (its STA columns would force
++//     the whole-design arrival search).  CTS_STAGE_FAST_VERIFY=1 also compares
++//     every recomputed port-load arrival with Sta::pinArrival (slow; check only).
++//   * runProbeFastEnd (cts::probe_fast_end): re-estimates the nets edited since the
++//     last pass and disables incremental parasitics (same parasitics as a
++//     whole-design estimate of the unedited tree).
 +#include <array>
 +#include <chrono>
 +#include <cmath>
@@ -9895,10 +10436,14 @@ index 0000000000..f3ade16958
 +#include <string>
 +#include <sstream>
 +#include <cstdlib>
++#include <cstring>
++#include <unordered_set>
 +#include "db_sta/dbSta.hh"
 +#include "db_sta/dbNetwork.hh"
++#include "est/EstimateParasitics.h"
 +#include "odb/db.h"
 +#include "sta/ArcDelayCalc.hh"
++#include "sta/Clock.hh"
 +#include "sta/Corner.hh"
 +#include "sta/DcalcAnalysisPt.hh"
 +#include "sta/Graph.hh"
@@ -9906,19 +10451,161 @@ index 0000000000..f3ade16958
 +#include "sta/Liberty.hh"
 +#include "sta/MinMax.hh"
 +#include "sta/Network.hh"
++#include "sta/PathAnalysisPt.hh"
 +#include "sta/PortDirection.hh"
++#include "sta/Sdc.hh"
++#include "sta/Search.hh"
 +#include "sta/TimingArc.hh"
 +#include "utl/Logger.h"
 +namespace cts {
-+void runStagePredictor(odb::dbDatabase* db, sta::dbSta* sta, utl::Logger* logger,
-+                       const char* path) {
++
++namespace {
++// clock source port arrivals of the unedited tree ([rf][min/max]), set by runProbeFastInit
++struct FastProbeState {
++  bool ready = false;
++  std::map<const sta::Pin*, std::array<std::array<float, 2>, 2>> portArr;
++};
++FastProbeState& fastProbe()
++{
++  static FastProbeState s;
++  return s;
++}
++
++bool envFlag(const char* n)
++{
++  const char* e = std::getenv(n);
++  return e && *e && std::string(e) != "0";
++}
++
++// Arrival of a load pin of a recorded clock-source-port net for (rf, mm) the way
++// OpenSTA's clock tag reaches it through the wire edge (PathVisitor::visitFromPath:
++// to_arrival = from_arrival + deratedDelay(...)).  false = no wire in-edge from a
++// recorded port.
++bool portLoadArrival(sta::dbSta* sta, const sta::Pin* pin, const sta::RiseFall* rf,
++                     const sta::MinMax* mm, float& arrival)
++{
++  auto* graph = sta->graph();
++  auto* lv = graph->pinLoadVertex(pin);
++  if (!lv) return false;
++  auto* path_ap = sta->cmdCorner()->findPathAnalysisPt(mm);
++  sta->findDelays(lv);  // level-limited: delays of the port net driver and its load slews
++  sta::VertexInEdgeIterator ei(lv, graph);
++  while (ei.hasNext()) {
++    auto* edge = ei.next();
++    if (!edge->isWire()) continue;
++    auto* fv = edge->from(graph);
++    auto it = fastProbe().portArr.find(fv->pin());
++    if (it == fastProbe().portArr.end()) continue;
++    for (auto* arc : edge->timingArcSet()->arcs()) {
++      if (!arc->fromEdge() || arc->fromEdge()->asRiseFall() != rf) continue;
++      const sta::Arrival from = it->second[rf->index()][mm->index()];
++      const sta::ArcDelay d = sta->search()->deratedDelay(fv, arc, edge, true, path_ap);
++      const sta::Arrival to = from + d;
++      arrival = sta::delayAsFloat(to);
++      return true;
++    }
++  }
++  return false;
++}
++}  // namespace
++
++bool runProbeFastInit(sta::dbSta* sta, est::EstimateParasitics* est, utl::Logger* logger)
++{
++  const auto begin = std::chrono::steady_clock::now();
++  auto* netw = sta->getDbNetwork();
++  auto* graph = sta->graph();
++  auto& st = fastProbe();
++  st.portArr.clear();
++  for (sta::Clock* clk : *sta->sdc()->clocks()) {
++    for (const sta::Pin* src : clk->pins()) {
++      if (!netw->isTopLevelPort(src)) continue;
++      std::array<std::array<float, 2>, 2> a{};
++      for (auto* rf : sta::RiseFall::range())
++        for (auto* mm : {sta::MinMax::min(), sta::MinMax::max()})
++          a[rf->index()][mm->index()] = sta::delayAsFloat(sta->pinArrival(src, rf, mm));
++      st.portArr[src] = a;
++    }
++  }
++  size_t checked = 0, bad = 0;
++  for (auto& [port, arr] : st.portArr) {
++    (void) arr;
++    auto* dv = graph->pinDrvrVertex(port);
++    if (!dv) continue;
++    sta::VertexOutEdgeIterator ei(dv, graph);
++    while (ei.hasNext()) {
++      auto* edge = ei.next();
++      if (!edge->isWire()) continue;
++      const sta::Pin* load = edge->to(graph)->pin();
++      for (auto* rf : sta::RiseFall::range())
++        for (auto* mm : {sta::MinMax::min(), sta::MinMax::max()}) {
++          float f = 0;
++          const float ref = sta::delayAsFloat(sta->pinArrival(load, rf, mm));
++          if (!portLoadArrival(sta, load, rf, mm, f) || std::memcmp(&f, &ref, sizeof f) != 0) {
++            ++bad;
++            logger->warn(utl::CTS, 2141, "Port-load arrival formula differs from STA at {} rf {} mm {}: {} vs {}",
++                         netw->pathName(load), rf->index(), mm->index(), f, ref);
++          }
++          ++checked;
++        }
++    }
++  }
++  if (envFlag("CTS_STAGE_FAST_INIT_FORCE_FAIL")) ++bad;  // regression test of the fail-closed path
++  if (bad || checked == 0) {
++    // fail-closed: no fast pass in this session; the caller uses the whole-design path for every candidate
++    logger->warn(utl::CTS, 2142, "Fast probe init failed (formula differs from STA on {} of {} values); full probe path used", bad, checked);
++    st.portArr.clear();
++    st.ready = false;
++    return false;
++  }
++  if (!est->isIncrementalParasiticsEnabled()) est->setIncrementalParasiticsEnabled(true);
++  st.ready = true;
++  logger->info(utl::CTS, 2140, "Fast probe init: {} clock source ports, port-load arrival formula bit-exact on {} values, {:.3f}s",
++               st.portArr.size(), checked, std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
++  return true;
++}
++
++void runProbeFastEnd(est::EstimateParasitics* est)
++{
++  if (est->isIncrementalParasiticsEnabled()) {
++    if (!est->parasiticsValid()) est->updateParasitics();
++    est->setIncrementalParasiticsEnabled(false);
++  }
++  fastProbe().ready = false;
++}
++
++void runStagePredictor(odb::dbDatabase* db, sta::dbSta* sta, est::EstimateParasitics* est,
++                       utl::Logger* logger, const char* path) {
 +  const auto begin = std::chrono::steady_clock::now();
 +  auto* netw=sta->getDbNetwork(); auto* graph=sta->graph();
 +  auto* block=db->getChip()->getBlock(); auto* corner=sta->cmdCorner();
++  // fast candidate pass of the decision probes (see the file header); all unset = the ordinary pass
++  std::unordered_set<std::string> portSeed;
++  const char* portFile = std::getenv("CTS_STAGE_PORT_SEED_PINS");
++  const bool fast = portFile != nullptr;
++  const bool noRows = envFlag("CTS_STAGE_NO_ROWS");
++  const bool verify = envFlag("CTS_STAGE_FAST_VERIFY");
++  const char* arrPath = std::getenv("CTS_STAGE_ARR_CSV");
++  double parS = 0;
++  if (fast) {
++    if (!fastProbe().ready) logger->error(utl::CTS, 2143, "Fast probe pass without cts::probe_fast_init");
++    std::ifstream pf(portFile);
++    if (!pf) logger->error(utl::CTS, 2144, "Cannot read the port-load pin list {}", portFile);
++    std::string l; while (std::getline(pf, l)) if (!l.empty()) portSeed.insert(l);
++    if (est->isIncrementalParasiticsEnabled() && !est->parasiticsValid()) {
++      const auto p0 = std::chrono::steady_clock::now();
++      est->updateParasitics();  // nets edited by the plan apply / undo since the last pass
++      parS = std::chrono::duration<double>(std::chrono::steady_clock::now() - p0).count();
++    }
++  }
 +  std::unique_ptr<sta::ArcDelayCalc> calc(sta->arcDelayCalc()->copy());
 +  struct State { double a=0,s=0,base=0,gates=0,wires=0; int depth=0; std::string root; };
-+  std::ofstream out(path); out<<std::setprecision(12);
-+  out<<"pin,kind,mode,rf,root,depth,pred_ps,sta_ps,slew_pred_ps,slew_sta_ps,base_ps,gates_ps,wires_ps,pin_cap_ff,wire_cap_ff,direct_loads\n";
++  std::ofstream out;
++  if (!noRows) {
++    out.open(path); out<<std::setprecision(12);
++    out<<"pin,kind,mode,rf,root,depth,pred_ps,sta_ps,slew_pred_ps,slew_sta_ps,base_ps,gates_ps,wires_ps,pin_cap_ff,wire_cap_ff,direct_loads\n";
++  }
++  std::ofstream arrOut;
++  if (arrPath) { arrOut.open(arrPath); arrOut<<std::setprecision(12)<<"pin,mode,pred_ps\n"; }
 +  std::map<std::string,std::pair<double,double>> frozen;
 +  if (const char* file=std::getenv("CTS_STAGE_BOUNDARY_CSV")) {
 +    std::ifstream in(file); if(!in)logger->error(utl::CTS,889,"Cannot read frozen boundaries {}",file);
@@ -9928,17 +10615,31 @@ index 0000000000..f3ade16958
 +      frozen[k]={std::stod(a),std::stod(b)};
 +    }
 +  }
++  if (fast && frozen.empty()) logger->error(utl::CTS, 2145, "Fast probe pass needs CTS_STAGE_BOUNDARY_CSV");
 +  std::ofstream seeds(std::string(path)+".boundaries.csv");
 +  seeds<<std::setprecision(17)<<"key,arrival_s,slew_s\n";
-+  size_t rows=0, kernels=0;
++  size_t rows=0, kernels=0, reseeded=0;
 +  for (auto* mm : {sta::MinMax::min(),sta::MinMax::max()}) {
 +    auto* ap=corner->findDcalcAnalysisPt(mm);
 +    using Key=std::pair<const sta::Pin*,int>;
 +    std::map<Key,State> predicted; std::set<Key> active;
 +    auto boundary=[&](const sta::Pin* pin,const sta::RiseFall* rf) {
 +      State x;
-+      std::string k=std::string(netw->pathName(pin))+"|"+std::to_string(mm->index())+"|"+std::to_string(rf->index());
-+      if(!frozen.empty()) {
++      std::string pk=netw->pathName(pin);
++      std::string k=pk+"|"+std::to_string(mm->index())+"|"+std::to_string(rf->index());
++      if (fast && portSeed.count(pk)) {
++        // load of a clock-source-port net: live seed (the slow probe takes it from a live pass)
++        x.s=sta::delayAsFloat(sta->vertexSlew(graph->pinLoadVertex(pin),rf,ap));
++        float a=0;
++        if (!portLoadArrival(sta, pin, rf, mm, a))
++          logger->error(utl::CTS, 2146, "{} is listed as a clock-port load but has no wire edge from a clock source port", pk);
++        if (verify) {
++          const float ref=sta::delayAsFloat(sta->pinArrival(pin,rf,mm));
++          if (std::memcmp(&a, &ref, sizeof a) != 0)
++            logger->error(utl::CTS, 2148, "Fast probe verify: port-load arrival {} differs from STA {} at {}", a, ref, k);
++        }
++        x.a=a; ++reseeded;
++      } else if(!frozen.empty()) {
 +        if(!frozen.count(k))logger->error(utl::CTS,2011,"New boundary not present before edit: {}",k);
 +        x.a=frozen.at(k).first;x.s=frozen.at(k).second;
 +      } else {
@@ -9946,7 +10647,7 @@ index 0000000000..f3ade16958
 +        x.s=sta::delayAsFloat(sta->vertexSlew(graph->pinLoadVertex(pin),rf,ap));
 +      }
 +      seeds<<k<<','<<x.a<<','<<x.s<<'\n';
-+      x.base=x.a;x.root=netw->pathName(pin);return x;
++      x.base=x.a;x.root=pk;return x;
 +    };
 +    std::function<State(const sta::Pin*,const sta::RiseFall*)> predict;
 +    predict=[&](const sta::Pin* pin,const sta::RiseFall* rf)->State {
@@ -10012,7 +10713,11 @@ index 0000000000..f3ade16958
 +      if(!clock && !buffer)continue;
 +      if(it->getSigType()==odb::dbSigType::POWER || it->getSigType()==odb::dbSigType::GROUND)continue;
 +      for(auto* rf:sta::RiseFall::range()) {
-+        auto x=predict(p,rf); float pc=0,wc=0;int count=0;
++        auto x=predict(p,rf);
++        if (arrPath && clock && rf==sta::RiseFall::rise())
++          arrOut<<netw->pathName(p)<<','<<(mm==sta::MinMax::min()?"min":"max")<<','<<x.a*1e12<<'\n';
++        if (noRows) {++rows; continue;}
++        float pc=0,wc=0;int count=0;
 +        if(it->getIoType()==odb::dbIoType::OUTPUT) {
 +          sta->graphDelayCalc()->loadCap(p,rf,ap,pc,wc);
 +          if(it->getNet()) for(auto* load:it->getNet()->getITerms())if(load->getIoType()==odb::dbIoType::INPUT)++count;
@@ -10024,6 +10729,8 @@ index 0000000000..f3ade16958
 +      }
 +    }
 +  }
++  if (fast)
++    logger->info(utl::CTS, 2147, "Fast probe pass: {} port-load seeds recomputed, incremental parasitics {:.3f}s", reseeded, parS);
 +  logger->info(utl::CTS,888,"Clock-arrival prediction: {} rows, {} delay-kernel calls, {:.3f}s (command corner; min/max x rise/fall; non-buffer boundaries seeded explicitly)",
 +    rows,kernels,std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count());
 +}
@@ -11963,7 +12670,7 @@ index 1c471a32d0..50a3107764 100644
    std::vector<TreeBuilder*> children_;
    // Tree buffer levels. Number of buffers inserted in first leg of the HTree
 diff --git a/src/cts/src/TritonCTS.cpp b/src/cts/src/TritonCTS.cpp
-index 42edd07a04..092cdc3e90 100644
+index 42edd07a04..5c7f87d671 100644
 --- a/src/cts/src/TritonCTS.cpp
 +++ b/src/cts/src/TritonCTS.cpp
 @@ -21,16 +21,22 @@
@@ -11989,15 +12696,18 @@ index 42edd07a04..092cdc3e90 100644
  #include "TreeBuilder.h"
  #include "db_sta/dbNetwork.hh"
  #include "db_sta/dbSta.hh"
-@@ -57,9 +63,57 @@
+@@ -57,9 +63,60 @@
  #include "utl/Logger.h"
  
  namespace cts {
 +// StagePredictor.cpp
 +void runStagePredictor(odb::dbDatabase*,
 +                       sta::dbSta*,
++                       est::EstimateParasitics*,
 +                       utl::Logger*,
 +                       const char*);
++bool runProbeFastInit(sta::dbSta*, est::EstimateParasitics*, utl::Logger*);
++void runProbeFastEnd(est::EstimateParasitics*);
 +// ClockRefinement.cpp
 +void runClockRefinement(odb::dbDatabase*,
 +                        sta::dbSta*,
@@ -12047,7 +12757,7 @@ index 42edd07a04..092cdc3e90 100644
  TritonCTS::TritonCTS(utl::Logger* logger,
                       odb::dbDatabase* db,
                       sta::dbNetwork* network,
-@@ -90,6 +144,42 @@ void TritonCTS::runTritonCts()
+@@ -90,6 +147,42 @@ void TritonCTS::runTritonCts()
    options_->addOwner(block);
  
    setupCharacterization();
@@ -12090,7 +12800,7 @@ index 42edd07a04..092cdc3e90 100644
    findClockRoots();
    populateTritonCTS();
    if (builders_.empty()) {
-@@ -107,6 +197,10 @@ void TritonCTS::runTritonCts()
+@@ -107,6 +200,10 @@ void TritonCTS::runTritonCts()
  
    // reset
    techChar_.reset();
@@ -12101,7 +12811,7 @@ index 42edd07a04..092cdc3e90 100644
    builders_.clear();
    staClockNets_.clear();
    visitedClockNets_.clear();
-@@ -296,6 +390,9 @@ void TritonCTS::buildClockTrees()
+@@ -296,6 +393,9 @@ void TritonCTS::buildClockTrees()
  {
    for (auto& builder : builders_) {
      builder->setTechChar(*techChar_);
@@ -12111,7 +12821,7 @@ index 42edd07a04..092cdc3e90 100644
      builder->setDb(db_);
      builder->setLogger(logger_);
      builder->initBlockages();
-@@ -356,6 +453,8 @@ void TritonCTS::initOneClockTree(odb::dbNet* driverNet,
+@@ -356,6 +456,8 @@ void TritonCTS::initOneClockTree(odb::dbNet* driverNet,
    }
  }
  
@@ -12120,7 +12830,7 @@ index 42edd07a04..092cdc3e90 100644
  void TritonCTS::countSinksPostDbWrite(
      TreeBuilder* builder,
      odb::dbNet* net,
-@@ -370,128 +469,117 @@ void TritonCTS::countSinksPostDbWrite(
+@@ -370,128 +472,117 @@ void TritonCTS::countSinksPostDbWrite(
      const std::unordered_set<odb::dbITerm*>& sinks,
      const std::unordered_set<odb::dbInst*>& dummies)
  {
@@ -12174,14 +12884,14 @@ index 42edd07a04..092cdc3e90 100644
 +          if (status == odb::dbPlacementStatus::NONE
 +              || status == odb::dbPlacementStatus::UNPLACED) {
 +            continue;
-           }
++          }
 +          for (odb::dbBox* box : pin->getBoxes()) {
 +            if (box) {
 +              driverX = box->xMin();
 +              driverY = box->yMin();
 +              break;
 +            }
-+          }
+           }
 +          break;
          }
 -        break;
@@ -12309,7 +13019,7 @@ index 42edd07a04..092cdc3e90 100644
  }
  
  ClockInst* TritonCTS::getClockFromInst(odb::dbInst* inst)
-@@ -561,6 +649,128 @@ void TritonCTS::writeDataToDb()
+@@ -561,6 +652,128 @@ void TritonCTS::writeDataToDb()
        }
      }
    }
@@ -12438,7 +13148,7 @@ index 42edd07a04..092cdc3e90 100644
  }
  
  void TritonCTS::forEachBuilder(
-@@ -1346,8 +1556,44 @@ TreeBuilder* TritonCTS::initClockTreeForMacrosAndRegs(
+@@ -1346,8 +1559,44 @@ TreeBuilder* TritonCTS::initClockTreeForMacrosAndRegs(
      return nullptr;
    }
  
@@ -12485,7 +13195,7 @@ index 42edd07a04..092cdc3e90 100644
      // There is no need for separate clock trees
      for (odb::dbITerm* iterm : firstNet->getITerms()) {
        odb::dbInst* inst = iterm->getInst();
-@@ -1445,10 +1691,27 @@ bool TritonCTS::separateMacroRegSinks(
+@@ -1445,10 +1694,27 @@ bool TritonCTS::separateMacroRegSinks(
        if (libertyCell && libertyCell->isInverter()) {
          odb::dbITerm* invertedTerm
              = inst->getFirstOutput()->getNet()->get1stSignalInput(false);
@@ -12515,7 +13225,7 @@ index 42edd07a04..092cdc3e90 100644
          macroSinks.emplace_back(inst, mterm);
        } else {
          registerSinks.emplace_back(inst, mterm);
-@@ -1596,6 +1859,15 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1596,6 +1862,15 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
  {
    Clock& clockNet = builder->getClock();
    odb::dbNet* topClockNet = clockNet.getNetObj();
@@ -12531,7 +13241,7 @@ index 42edd07a04..092cdc3e90 100644
    // gets the module for the driver for the net
    sta::Pin* pin_driver = nullptr;
    odb::dbModule* top_module = network_->getNetDriverParentModule(
-@@ -1603,11 +1875,6 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1603,11 +1878,6 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
    (void) pin_driver;
  
    disconnectAllSinksFromNet(topClockNet);
@@ -12543,7 +13253,7 @@ index 42edd07a04..092cdc3e90 100644
    destroyClockModNet(pin_driver);
  
    // re-connect top buffer that separates macros from registers
-@@ -1617,16 +1884,47 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1617,16 +1887,47 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      if (topRegBuffer) {
        odb::dbITerm* topRegBufferInputPin = getFirstInput(topRegBuffer);
        topRegBufferInputPin->connect(builder->getDrivingNet());
@@ -12596,7 +13306,7 @@ index 42edd07a04..092cdc3e90 100644
    topClockNet->setSigType(odb::dbSigType::CLOCK);
  
    std::map<int, int> fanoutcount;
-@@ -1640,9 +1938,29 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1640,9 +1941,29 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      bool outputPinFound = true;
      bool inputPinFound = true;
      bool leafLevelNet = subNet.isLeafLevel();
@@ -12627,7 +13337,7 @@ index 42edd07a04..092cdc3e90 100644
      odb::dbNet* clkSubNet
          = odb::dbNet::create(block_, subNet.getName().c_str());
      subNet.setNetObj(clkSubNet);
-@@ -1652,7 +1970,7 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1652,7 +1973,7 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
  
      odb::dbInst* driver = subNet.getDriver()->getDbInst();
      odb::dbITerm* driverInputPin = getFirstInput(driver);
@@ -12636,7 +13346,7 @@ index 42edd07a04..092cdc3e90 100644
      odb::dbITerm* outputPin = driver->getFirstOutput();
      if (outputPin == nullptr) {
        outputPinFound = false;
-@@ -1666,6 +1984,10 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1666,6 +1987,10 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      }
  
      subNet.forEachSink([&](ClockInst* inst) {
@@ -12647,7 +13357,7 @@ index 42edd07a04..092cdc3e90 100644
        odb::dbITerm* inputPin = nullptr;
        if (inst->isClockBuffer()) {
          odb::dbInst* sink = inst->getDbInst();
-@@ -1702,14 +2024,16 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1702,14 +2027,16 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      }
  
      if (!inputPinFound || !outputPinFound) {
@@ -12672,7 +13382,7 @@ index 42edd07a04..092cdc3e90 100644
      }
    });
  
-@@ -1734,6 +2058,34 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1734,6 +2061,34 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      }
    });
  
@@ -12707,7 +13417,7 @@ index 42edd07a04..092cdc3e90 100644
    logger_->info(
        CTS, 12, "    Minimum number of buffers in the clock path: {}.", minPath);
    logger_->info(
-@@ -1987,7 +2339,14 @@ std::pair<int, int> TritonCTS::branchBufferCount(ClockInst* inst,
+@@ -1987,7 +2342,14 @@ std::pair<int, int> TritonCTS::branchBufferCount(ClockInst* inst,
                                                   Clock& clockNet)
  {
    odb::dbInst* sink = inst->getDbInst();
@@ -12722,7 +13432,7 @@ index 42edd07a04..092cdc3e90 100644
    int minPath = std::numeric_limits<int>::max();
    int maxPath = std::numeric_limits<int>::min();
    for (odb::dbITerm* sinkITerms : outITerm->getNet()->getITerms()) {
-@@ -2051,11 +2410,43 @@ void TritonCTS::checkUpstreamConnections(odb::dbNet* net)
+@@ -2051,11 +2413,43 @@ void TritonCTS::checkUpstreamConnections(odb::dbNet* net)
  
  void TritonCTS::createClockBuffers(Clock& clockNet, odb::dbModule* parent)
  {
@@ -12766,7 +13476,7 @@ index 42edd07a04..092cdc3e90 100644
      newInst->setSourceType(odb::dbSourceType::TIMING);
      inst.setInstObj(newInst);
      inst2clkbuf_[newInst] = &inst;
-@@ -2152,7 +2543,7 @@ bool TritonCTS::isSink(odb::dbITerm* iterm)
+@@ -2152,7 +2546,7 @@ bool TritonCTS::isSink(odb::dbITerm* iterm)
      return true;
    }
  
@@ -12775,7 +13485,7 @@ index 42edd07a04..092cdc3e90 100644
      return true;
    }
  
-@@ -2250,19 +2641,38 @@ static float getInputCap(const sta::LibertyCell* cell)
+@@ -2250,19 +2644,38 @@ static float getInputCap(const sta::LibertyCell* cell)
    return 0.0;
  }
  
@@ -12816,7 +13526,7 @@ index 42edd07a04..092cdc3e90 100644
    return bestCell;
  }
  
-@@ -2283,7 +2693,7 @@ int TritonCTS::writeDummyLoadsToDb(Clock& clockNet,
+@@ -2283,7 +2696,7 @@ int TritonCTS::writeDummyLoadsToDb(Clock& clockNet,
    int nDummies = 0;
    clockNet.forEachSubNet([&](ClockSubNet& subNet) {
      subNet.forEachSink([&](ClockInst* inst) {
@@ -12825,7 +13535,7 @@ index 42edd07a04..092cdc3e90 100644
            && !sta::fuzzyEqual(inst->getOutputCap(),
                                inst->getIdealOutputCap())) {
          odb::dbInst* dummyInst
-@@ -2314,6 +2724,9 @@ bool TritonCTS::computeIdealOutputCaps(Clock& clockNet)
+@@ -2314,6 +2727,9 @@ bool TritonCTS::computeIdealOutputCaps(Clock& clockNet)
      driver2subnet_[driver] = &subNet;
      float sinkCapTotal = 0.0;
      subNet.forEachSink([&](ClockInst* inst) {
@@ -12835,7 +13545,7 @@ index 42edd07a04..092cdc3e90 100644
        odb::dbITerm* inputPin = inst->isClockBuffer()
                                     ? getFirstInput(inst->getDbInst())
                                     : inst->getDbInputPin();
-@@ -2469,7 +2882,20 @@ odb::dbInst* TritonCTS::insertDummyCell(
+@@ -2469,7 +2885,20 @@ odb::dbInst* TritonCTS::insertDummyCell(
      return nullptr;
    }
    float deltaCap = inst->getIdealOutputCap() - inst->getOutputCap();
@@ -12857,7 +13567,7 @@ index 42edd07a04..092cdc3e90 100644
    // clang-format off
    debugPrint(logger_, CTS, "dummy load", 1, "insertDummyCell {} at {}",
               inst->getName(), dummyCell->name());
-@@ -2501,10 +2927,34 @@ ClockInst& TritonCTS::placeDummyCell(Clock& clockNet,
+@@ -2501,10 +2930,34 @@ ClockInst& TritonCTS::placeDummyCell(Clock& clockNet,
        = options_->getDummyLoadPrefix() + std::to_string(dummyLoadIndex_++);
    dummyInst = odb::dbInst::create(block_, master, cellName.c_str());
    dummyInst->setSourceType(odb::dbSourceType::TIMING);
@@ -12894,7 +13604,7 @@ index 42edd07a04..092cdc3e90 100644
    // clang-format off
    debugPrint(logger_, CTS, "dummy load", 1, "  placed dummy instance {} at {}",
               dummyInst->getName(), dummyInst->getLocation());
-@@ -2596,4 +3046,144 @@ void TritonCTS::balanceMacroRegisterLatencies()
+@@ -2596,4 +3049,154 @@ void TritonCTS::balanceMacroRegisterLatencies()
    }
  }
  
@@ -13035,12 +13745,22 @@ index 42edd07a04..092cdc3e90 100644
 +
 +void TritonCTS::predictClockArrivals(const char* output_csv)
 +{
-+  runStagePredictor(db_, openSta_, logger_, output_csv);
++  runStagePredictor(db_, openSta_, estimate_parasitics_, logger_, output_csv);
++}
++
++bool TritonCTS::probeFastInit()
++{
++  return runProbeFastInit(openSta_, estimate_parasitics_, logger_);
++}
++
++void TritonCTS::probeFastEnd()
++{
++  runProbeFastEnd(estimate_parasitics_);
 +}
 +
  }  // namespace cts
 diff --git a/src/cts/src/TritonCTS.i b/src/cts/src/TritonCTS.i
-index ba0b7ce2d3..f9b42313bd 100644
+index ba0b7ce2d3..775d76b629 100644
 --- a/src/cts/src/TritonCTS.i
 +++ b/src/cts/src/TritonCTS.i
 @@ -8,6 +8,8 @@
@@ -13052,7 +13772,7 @@ index ba0b7ce2d3..f9b42313bd 100644
  #include "ord/OpenRoad.hh"
  
  namespace ord {
-@@ -498,4 +500,140 @@ reset_wire_segment_distance_unit()
+@@ -498,4 +500,154 @@ reset_wire_segment_distance_unit()
  {
    getTritonCts()->getParms()->resetWireSegmentUnit();
  }
@@ -13119,6 +13839,20 @@ index ba0b7ce2d3..f9b42313bd 100644
 +predict_clock_arrivals(const char* output_csv)
 +{
 +  getTritonCts()->predictClockArrivals(output_csv);
++}
++
++// Decision probes, fast candidate passes (see StagePredictor.cpp).
++// 1 = fast candidate passes enabled; 0 = initialization check failed (use the whole-design path)
++int
++probe_fast_init()
++{
++  return getTritonCts()->probeFastInit() ? 1 : 0;
++}
++
++void
++probe_fast_end()
++{
++  getTritonCts()->probeFastEnd();
 +}
 +
 +// ---- early-clock decision (file based; the probe loop runs in Tcl in the same session)

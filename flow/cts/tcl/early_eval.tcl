@@ -10,4 +10,6 @@ estimate_parasitics -placement
 sta::worst_slack_cmd max
 source $::env(OPENROAD_SCRIPTS_DIR)/early_clock.tcl
 source $::env(OPENROAD_SCRIPTS_DIR)/early_probe.tcl
+# the session ends after the probe: no parasitics restore at the end of probe_candidates
+set ::early_probe_shard 1
 probe_candidates $::env(EARLY_CANDS) $::env(REPORTS_DIR)

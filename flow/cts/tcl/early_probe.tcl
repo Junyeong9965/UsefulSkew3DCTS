@@ -6,6 +6,7 @@
 #     <cands_dir>/list.txt (one cid per line) and <cid>.tsv plan fragments (early_clock.tcl format)
 #     <reports_dir>/arr_<cid>.csv : register clock pin, mode (min|max), predicted rise arrival (ps)
 #     <reports_dir>/arr_base.csv  : the same for the unedited tree; raw_base.csv = every predicted stage of it
+#   env CTS3D_PROBE_FAST (default 1): fast candidate passes (snap_candidate_fast); 0 = snap_candidate
 
 proc snap_arrivals {out id} {
   set raw "$out/raw_$id.csv"
@@ -30,6 +31,19 @@ proc port_load_pins {} {
     }
   }
   return $out
+}
+# fast candidate snapshot (cts::probe_fast_init done): one predictor pass with the frozen boundaries, the entry-net loads
+# re-seeded in C++ (Sta::vertexSlew + clock-port arrival + derated wire delay, proven bit-exact against STA at init)
+# and the nets of the plan edits re-estimated incrementally; writes the same arr_<id>.csv and raw_<id>.csv.boundaries.csv
+# as snap_candidate without the whole-design parasitics, delay calculation and arrival search of the live pass.
+proc snap_candidate_fast {out id} {
+  set pf "$out/ports_$id.txt"; set fo [open $pf w]
+  foreach p [port_load_pins] { puts $fo $p }
+  close $fo
+  set ::env(CTS_STAGE_PORT_SEED_PINS) $pf; set ::env(CTS_STAGE_NO_ROWS) 1; set ::env(CTS_STAGE_ARR_CSV) "$out/arr_$id.csv"
+  predict_clock_arrivals "$out/raw_$id.csv"
+  unset ::env(CTS_STAGE_PORT_SEED_PINS) ::env(CTS_STAGE_NO_ROWS) ::env(CTS_STAGE_ARR_CSV)
+  file delete $pf
 }
 # candidate snapshot with the entry-net loads re-seeded from the edited net (live boundaries)
 proc snap_candidate {out id} {
@@ -79,20 +93,35 @@ proc probe_candidates {cands out} {
   }
   close $fi; close $fo
   set ::env(CTS_STAGE_BOUNDARY_CSV) "$out/boundaries_aug.csv"
+  # fast candidate passes (default); CTS3D_PROBE_FAST=0 = whole-design parasitics + live pass per candidate
+  set fast [expr {![info exists ::env(CTS3D_PROBE_FAST)] || $::env(CTS3D_PROBE_FAST) ne "0"}]
+  # fail-closed: if the port-load arrival check of the init fails, every candidate takes the whole-design path
+  if {$fast && ![cts::probe_fast_init]} {
+    puts "EARLY_EVAL fast probe init check failed: whole-design path for every candidate"
+    set fast 0
+  }
   set lf [open "$cands/list.txt" r]
   set n 0
   while {[gets $lf cid] >= 0} {
     if {$cid eq ""} continue
     set undo [apply_early_clock_plan $block "$cands/$cid.tsv" $cid]
-    estimate_parasitics -placement
-    snap_candidate $out $cid
+    if {$fast} {
+      snap_candidate_fast $out $cid
+    } else {
+      estimate_parasitics -placement
+      snap_candidate $out $cid
+    }
     undo_early_clock_plan $undo
     incr n
   }
   close $lf
   unset ::env(CTS_STAGE_BOUNDARY_CSV)
-  estimate_parasitics -placement
-  puts "EARLY_EVAL candidates=$n elapsed_ms=[expr {[clock milliseconds]-$t0}]"
+  # restore the parasitics of the unedited tree for the rest of the session (fast: only the nets of the last undo are
+  # re-estimated); a shard session (early_eval.tcl) exits right after the probe, so it skips the restore
+  if {![info exists ::early_probe_shard]} {
+    if {$fast} { cts::probe_fast_end } else { estimate_parasitics -placement }
+  }
+  puts "EARLY_EVAL candidates=$n fast=$fast elapsed_ms=[expr {[clock milliseconds]-$t0}]"
 }
 
 # probe_candidates_sharded <cands> <out>: the same probe as probe_candidates, with the candidate list split round-robin

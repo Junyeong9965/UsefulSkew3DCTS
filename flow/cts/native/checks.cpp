@@ -150,22 +150,27 @@ int targets_main(const std::string& R)
   };
   for (auto& n : Torder) { check("lower_bound", -T[n], J::S(n)); check("global_upper", T[n] - .05, J::S(n)); }
   {
-    Table g = read_table(join_path(R, "pre_cts_ff_timing_graph.csv"));
+    // streamed row by row (the graph has > 10 M rows on the largest case); same row order and values as read_table
+    TableStream g(join_path(R, "pre_cts_ff_timing_graph.csv"));
     int cf = g.col("from_ff"), ct = g.col("to_ff"), cmin = g.col("slack_min_ns"), cmax = g.col("slack_max_ns");
     long long num = 2;
-    for (auto& r : g.rows) {
-      const std::string& i = r[cf];
-      const std::string& j = r[ct];
+    std::vector<std::string_view> r;
+    std::string i, j, smin, smax;
+    while (g.next(r)) {
+      i.assign(r[cf].data(), r[cf].size());
+      j.assign(r[ct].data(), r[ct].size());
+      smin.assign(r[cmin].data(), r[cmin].size());
+      smax.assign(r[cmax].data(), r[cmax].size());
       if (!T.count(i) || !T.count(j)) fail("Missing target (" + i + ", " + j + ")");
       double a = T[i], b = T[j];
       check("delivery_bound", a - to_double(V[i].first), J::S(i));
-      double s = to_double(r[cmin]);
+      double s = to_double(smin);
       if (std::isfinite(s)) {
         double h = s - .012, cap = std::max(0., -h), required = std::max(0., b - a - h);
         check("FF_hold_residual", required - cap, J::I(num));
         counts["ff_hold"]++; residual_sum += required; baseline_sum += cap;
       }
-      double sm = to_double(r[cmax]);
+      double sm = to_double(smax);
       if (std::isfinite(sm)) {
         check("setup_epigraph", a - b - to_double(V[j].second) - (sm - .002), J::I(num));
         counts["setup"]++;
@@ -405,7 +410,25 @@ int lp_bounds_main(const std::string& plan, const std::string& graph, const std:
     for (auto& r : t.rows) for (auto& mp : split(r[t.col("members")], ';')) if (!mp.empty()) zero.insert(inst_of(mp));
   }
   std::set<std::string> names, ports;
-  { Table g = read_table(graph); for (auto& e : g.rows) { names.insert(e[g.col("from_ff")]); names.insert(e[g.col("to_ff")]); } }
+  {
+    // the graph is streamed (two columns, > 10 M rows on the largest case); the distinct names are collected in a hash
+    // set and sorted once, which gives the same ordered set as inserting every row into `names`
+    TableStream g(graph);
+    const int cf = g.col("from_ff"), ct = g.col("to_ff");
+    std::unordered_set<std::string> seen;
+    std::vector<std::string_view> f;
+    std::string last_from, key;
+    bool have_last = false;
+    while (g.next(f)) {
+      if (!have_last || f[cf] != last_from) {   // rows of one launch register are consecutive
+        last_from.assign(f[cf].data(), f[cf].size()); have_last = true;
+        seen.insert(last_from);
+      }
+      key.assign(f[ct].data(), f[ct].size());
+      if (!seen.count(key)) seen.insert(key);
+    }
+    names.insert(seen.begin(), seen.end());
+  }
   { Table t = read_table(io); for (auto& e : t.rows) { names.insert(e[t.col("ff_name")]); names.insert(e[t.col("port_name")]); ports.insert(e[t.col("port_name")]); } }
   std::set<std::string> leaf, macros;
   { Table t = read_table(join_path(pdir, "phase1_leaf_groups.csv")); for (auto& r : t.rows) leaf.insert(inst_of(r[t.col("sink")])); }
