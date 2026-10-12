@@ -44,13 +44,24 @@ done
 cmake -S "$SRC" -B "$SRC/build" "${cfg[@]}"
 cmake --build "$SRC/build" -j"$JOBS" --target openroad
 
-# ---- prebuilt OR-Tools: libortools.so contains absl, so the explicit absl libraries on the openroad link line are
-#      removed (duplicate copies fail the absl ODR check at start-up) and the binary is relinked once; RPATH_DIRS
-#      (deps.local.sh) are added as run paths for OR-Tools / spdlog.
+# ---- link fix-ups, then one relink when anything changed
+#   (1) prebuilt OR-Tools: libortools.so contains absl, so the explicit absl libraries on the openroad link line are
+#       removed (duplicate copies fail the absl ODR check at start-up);
+#   (2) run paths: the directory of every shared library the binary resolves on this server outside the system
+#       directories (ldd in the build environment, plus TCL_LIBRARY of the CMake cache and RPATH_DIRS of
+#       deps.local.sh) is recorded in the binary, so it runs without LD_LIBRARY_PATH on the server where it was built.
+BIN=$SRC/build/bin/openroad
 LT=$SRC/build/src/CMakeFiles/openroad.dir/link.txt
-if grep -qE 'libabsl[a-z0-9_]*\.(a|so)' "$LT"; then
-  sed -i -E 's#[^ ]*libabsl[a-z0-9_]*\.a##g; s#[^ ]*libabsl[a-z0-9_]*\.so[.0-9]*##g; s#-labsl[a-z0-9_]*##g' "$LT"
-  for d in ${RPATH_DIRS:-}; do grep -q -- "-rpath,$d " "$LT" || sed -i "s#-rdynamic #-rdynamic -Wl,-rpath,$d #" "$LT"; done
-  ( cd "$SRC/build/src" && eval "$(cat CMakeFiles/openroad.dir/link.txt)" )
-fi
-echo "binary: $SRC/build/bin/openroad"
+before=$(cksum < "$LT")
+sed -i -E 's#[^ ]*libabsl[a-z0-9_]*\.a##g; s#[^ ]*libabsl[a-z0-9_]*\.so[.0-9]*##g; s#-labsl[a-z0-9_]*##g' "$LT"
+dirs=()
+add_dir() { case $1 in ''|/lib|/lib64|/usr/lib|/usr/lib64) return;; esac; [[ " ${dirs[*]} " == *" $1 "* ]] || dirs+=("$1"); }
+for d in ${RPATH_DIRS:-}; do add_dir "$d"; done
+tcl=$(sed -n 's/^TCL_LIBRARY:[A-Z]*=//p' "$SRC/build/CMakeCache.txt")
+[[ $tcl == *.so* ]] && add_dir "$(dirname "$tcl")"
+while read -r lib; do add_dir "$(dirname "$lib")"; done < <(ldd "$BIN" 2>/dev/null | sed -n 's#^.* => \(/[^ ]*\) .*#\1#p')
+for d in "${dirs[@]}"; do grep -q -- "-rpath,$d " "$LT" || sed -i "s#-rdynamic #-rdynamic -Wl,-rpath,$d #" "$LT"; done
+if [[ $(cksum < "$LT") != "$before" ]]; then ( cd "$SRC/build/src" && eval "$(cat CMakeFiles/openroad.dir/link.txt)" ); fi
+missing=$(env -u LD_LIBRARY_PATH ldd "$BIN" 2>/dev/null | sed -n 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' | tr '\n' ' ')
+[[ -z $missing ]] || echo "warning: not found without LD_LIBRARY_PATH: $missing(add their directories to LD_LIBRARY_PATH in setup_env.sh)" >&2
+echo "binary: $BIN"
