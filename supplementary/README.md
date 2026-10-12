@@ -57,13 +57,13 @@ requested targets are matched. The median absolute error $|e_i| = |\hat a_i - a_
 
 | Platform | Design | $\lvert\mathcal R\rvert$ | $F_{\mathrm{match}}$ (%) | median $\lvert e_i\rvert$ (ps) |
 |---|---|---:|---:|---:|
-| A7/A7 | AES | 118 | 94.2 | 4.4 |
-| A7/A7 | IBEX | 775 | 93.9 | 4.4 |
-| A7/A7 | JPEG | 450 | 87.8 | 8.0 |
-| A7/A7 | SWERV | 1589 | 93.6 | 3.8 |
-| A7/A7 | ARIANE | 7287 | 86.3 | 6.7 |
-| A7/N45 | AES | 117 | 89.5 | 9.4 |
-| A7/N45 | IBEX | 992 | 76.8 | 28.8 |
-| A7/N45 | JPEG | 3911 | 85.0 | 16.4 |
-| A7/N45 | SWERV | 616 | 84.1 | 14.2 |
-| A7/N45 | ARIANE | 3731 | 86.4 | 14.3 |
+| A7/A7 | AES | 119 | 93.1 | 5.1 |
+| A7/A7 | IBEX | 708 | 93.1 | 5.3 |
+| A7/A7 | JPEG | 446 | 87.9 | 7.9 |
+| A7/A7 | SWERV | 1480 | 92.7 | 4.1 |
+| A7/A7 | ARIANE | 3178 | 87.2 | 6.2 |
+| A7/N45 | AES | 117 | 88.9 | 10.5 |
+| A7/N45 | IBEX | 992 | 76.5 | 29.8 |
+| A7/N45 | JPEG | 3768 | 85.3 | 16.3 |
+| A7/N45 | SWERV | 586 | 83.9 | 12.4 |
+| A7/N45 | ARIANE | 3723 | 86.4 | 14.4 |
