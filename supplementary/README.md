@@ -31,7 +31,7 @@ Data: [`data/post_cts_timing.csv`](data/post_cts_timing.csv).
 
 ## CTS Runtime
 
-CTS wall time measured on the same server for both flows. Our CTS takes 4.2× to 7.5× the CTS time of Pin-3D.
+CTS wall time measured on the same server for both flows. Our CTS takes 3.3× to 6.6× the CTS time of Pin-3D.
 Pin-3D runs a single balanced CTS with clock buffers on one tier. Our flow additionally extracts the register timing
 graph with STA, solves the scheduling LP, and evaluates early-clock construction and refinement moves with
 whole-design STA.
