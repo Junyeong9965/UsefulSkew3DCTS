@@ -51,7 +51,9 @@ Main tools and libraries tested (Linux x86-64); the full dependency setup is in 
    ```
    openroad/build_openroad.sh ../OpenROAD-3dcts
    ```
-2. Create the site configuration and set `CTS3D_OPENROAD` (and `INNOVUS_EXE` for `ariane133`).
+2. Create the site configuration and set `CTS3D_OPENROAD` (and `INNOVUS_EXE` for `ariane133`). If OpenROAD reports a
+   missing shared library (for example `libtcl.so`), load the same modules as for the build in `setup_env.sh` (for
+   example `module load tcl`) or add the library directory to `LD_LIBRARY_PATH` there.
    ```
    cp setup_env.example.sh setup_env.sh
    ```
