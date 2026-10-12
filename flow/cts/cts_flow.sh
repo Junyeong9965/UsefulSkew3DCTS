@@ -37,7 +37,7 @@ T0=$(date +%s.%N)
 # change the circuit, the decision and the output.  Checking steps are timed in work/out/times.txt only; the OpenROAD
 # console of every step goes to work/logs/.
 elapsed() { local s=$(( $(date +%s) - ${T0%.*} )); printf '%02d:%02d:%02d' $((s/3600)) $((s%3600/60)) $((s%60)); }
-say() { printf '%s  %s\n' "$(elapsed)" "$*"; }
+say() { printf '%s\n' "$*"; }
 # step_title <step name>: arm and description of a step for the log
 step_title() { local n=$1 a="" s=$1
   case $n in
@@ -75,7 +75,7 @@ log_step() { local n=$1 rc=$2 l w u p m
   w=$(sed -n 's/.*wall_s=\([^ ]*\).*/\1/p' <<< "$l"); u=$(sed -n 's/.*user_s=\([^ ]*\).*/\1/p' <<< "$l"); p=$(sed -n 's/.*peak_kb=\([^ ]*\).*/\1/p' <<< "$l")
   if [[ $rc != 0 ]]; then say "$(step_title "$n")  FAILED (rc=$rc, see work/logs/)"; return; fi
   quiet "$n" && return 0
-  say "$(printf '%-70s %8.1f s  cpu %8.1f s  mem %5.1f GB' "$(step_title "$n")" "${w:-0}" "${u:-0}" "$(echo "${p:-0}/1048576" | bc -l)")"
+  say "$(printf '%-70s %8.1f s' "$(step_title "$n")" "${w:-0}")"
   m=$(step_metrics "$n"); [[ -z $m ]] || { m=$(fmt_metrics "$m"); [[ -z $m ]] || say "          -> $m"; }; }
 # st <name> <cmd...>: run and time one step; abort the run on failure
 st() { local n=$1; shift
@@ -109,7 +109,7 @@ say "3D CTS  case $c  ($plat / $des, clock period ${src##*/T} ps)"
 say "        host $(hostname -s), threads $THREADS"
 say "        placement $src"
 say "        OpenROAD $CTS3D_OPENROAD"
-say "        step logs: $RUN/logs/   (columns: elapsed h:m:s | step | wall | cpu | peak memory)"
+say "        step logs: $RUN/logs/"
 
 # ---------------------------------------------------------------------------------------------- OFF chain
 # ---------------------------------------------------------------------------------------------- OFF refinement
@@ -210,13 +210,13 @@ arm_k() { local p=$1 k=$2 KR=$3
       log_step "K${k}_on_$s" $rc
       [[ $rc == 0 ]] || { echo "K${k}_on_$s failed" >> "$T"; return 1; }
     done; }
-  chain_k P G GB D || { echo "MULTI k=$k build failed" >> "$T"; say "early k=$k prefix not built (candidate dropped)"; return 0; }
+  chain_k P G GB D || { echo "MULTI k=$k build failed" >> "$T"; return 0; }
   local p1n d1n
   p1n=$(grep -c "CTS_NO_INSERTION_DELAY=1" "$KR/logs/on_P.log"); d1n=$(grep -c "CTS_NO_INSERTION_DELAY=1" "$KR/logs/on_D.log")
   echo "NID_CHECK arm=k$k P_lines=$p1n D_lines=$d1n" >> "$T"
-  [[ ($p1n -gt 0 && $d1n -gt 0) || ($p1n == 0 && $d1n == 0) ]] || { echo "MULTI k=$k build failed" >> "$T"; say "early k=$k prefix not built (candidate dropped)"; return 0; }
+  [[ ($p1n -gt 0 && $d1n -gt 0) || ($p1n == 0 && $d1n == 0) ]] || { echo "MULTI k=$k build failed" >> "$T"; return 0; }
   trim "$KR/arms/on/P/$sub/phase1.odb"
-  chain_k GA R J Q F || { echo "MULTI k=$k build failed" >> "$T"; say "early k=$k prefix not built (candidate dropped)"; return 0; }
+  chain_k GA R J Q F || { echo "MULTI k=$k build failed" >> "$T"; return 0; }
   # every step after a successful build is checked; a failure aborts the run (as in the OFF / ON arms)
   st "K${k}_PREP" bash "$CTS_DIR/route_prep.sh" "$KR/route_prep/on" "$KR/arms/on/final" "$plat" "$des" "$src"
   st "K${k}_NATIVE" bash "$CTS_DIR/openroad_run.sh" "$KR/route_prep/on/native" "$plat" "$des" "$KR/route_prep/on/$sub/4_cts.odb" "$KR/route_prep/on/$sub/4_cts.sdc" \
