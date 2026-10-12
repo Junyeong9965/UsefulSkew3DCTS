@@ -106,9 +106,7 @@ prep_native() { local dir=$1 prep=$2 o=$3 tag=$4
   cp "$prep/native/reports/metrics.csv" "$o/native_$tag.csv"; cp "$prep/native/reports/electrical.csv" "$o/native_elec_$tag.csv"; }
 
 say "3D CTS  case $c  ($plat / $des, clock period ${src##*/T} ps)"
-early=off; [[ ${CTS3D_EARLY_CLOCK:-1} != 1 ]] || early=on
-[[ ${CTS3D_ON_GATE:-1} == 1 || $early != on ]] || early=full
-say "        host $(hostname -s), threads $THREADS, early-clock construction $early"
+say "        host $(hostname -s), threads $THREADS"
 say "        placement $src"
 say "        OpenROAD $CTS3D_OPENROAD"
 say "        step logs: $RUN/logs/   (columns: elapsed h:m:s | step | wall | cpu | peak memory)"
@@ -142,8 +140,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------- decision
-# CTS3D_EARLY_CLOCK=0 (run_cts.sh --early off): no decision and no ON arm; the output is the OFF arm.
-plan=""; reason="early-clock construction disabled (--early off)"; kind=""
+# CTS3D_EARLY_CLOCK=0: no decision and no ON arm; the output is the OFF arm.
+plan=""; reason="early-clock construction disabled (CTS3D_EARLY_CLOCK=0)"; kind=""
 if [[ ${CTS3D_EARLY_CLOCK:-1} == 1 ]]; then
   DEC=$RUN/decide; mkdir -p "$DEC"
   P1=$RUN/arms/off/P/$sub
@@ -275,7 +273,7 @@ if [[ $kind == hub ]]; then
 fi
 
 # ---------------------------------------------------------------------------------------------- prune
-# Unless CTS3D_KEEP_INTERMEDIATES=1 (run_cts.sh -k), removes the extraction partitions and graph CSVs, the probe-session
+# Unless CTS3D_KEEP_INTERMEDIATES=1, removes the extraction partitions and graph CSVs, the probe-session
 # databases, the per-stage checkpoints and the route-input copies.  OUTPUT/, out/, logs/, the decision files and the
 # stage reports are kept.
 prune_run() {

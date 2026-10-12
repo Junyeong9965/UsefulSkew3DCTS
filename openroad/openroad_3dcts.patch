@@ -10374,10 +10374,10 @@ index 0000000000..d9eba4fd27
 +}  // namespace cts
 diff --git a/src/cts/src/StagePredictor.cpp b/src/cts/src/StagePredictor.cpp
 new file mode 100644
-index 0000000000..2d678205ec
+index 0000000000..0c274e290a
 --- /dev/null
 +++ b/src/cts/src/StagePredictor.cpp
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,349 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -10419,8 +10419,7 @@ index 0000000000..2d678205ec
 +//     arrival is the formula above; CTS_STAGE_ARR_CSV = the register clock pin
 +//     rows (rise edge: pin,mode,pred_ps; the text the Tcl filter writes from the
 +//     row file); CTS_STAGE_NO_ROWS=1 = no row file (its STA columns would force
-+//     the whole-design arrival search).  CTS_STAGE_FAST_VERIFY=1 also compares
-+//     every recomputed port-load arrival with Sta::pinArrival (slow; check only).
++//     the whole-design arrival search).
 +//   * runProbeFastEnd (cts::probe_fast_end): re-estimates the nets edited since the
 +//     last pass and disables incremental parasitics (same parasitics as a
 +//     whole-design estimate of the unedited tree).
@@ -10549,7 +10548,6 @@ index 0000000000..2d678205ec
 +        }
 +    }
 +  }
-+  if (envFlag("CTS_STAGE_FAST_INIT_FORCE_FAIL")) ++bad;  // regression test of the fail-closed path
 +  if (bad || checked == 0) {
 +    // fail-closed: no fast pass in this session; the caller uses the whole-design path for every candidate
 +    logger->warn(utl::CTS, 2142, "Fast probe init failed (formula differs from STA on {} of {} values); full probe path used", bad, checked);
@@ -10583,7 +10581,6 @@ index 0000000000..2d678205ec
 +  const char* portFile = std::getenv("CTS_STAGE_PORT_SEED_PINS");
 +  const bool fast = portFile != nullptr;
 +  const bool noRows = envFlag("CTS_STAGE_NO_ROWS");
-+  const bool verify = envFlag("CTS_STAGE_FAST_VERIFY");
 +  const char* arrPath = std::getenv("CTS_STAGE_ARR_CSV");
 +  double parS = 0;
 +  if (fast) {
@@ -10633,11 +10630,6 @@ index 0000000000..2d678205ec
 +        float a=0;
 +        if (!portLoadArrival(sta, pin, rf, mm, a))
 +          logger->error(utl::CTS, 2146, "{} is listed as a clock-port load but has no wire edge from a clock source port", pk);
-+        if (verify) {
-+          const float ref=sta::delayAsFloat(sta->pinArrival(pin,rf,mm));
-+          if (std::memcmp(&a, &ref, sizeof a) != 0)
-+            logger->error(utl::CTS, 2148, "Fast probe verify: port-load arrival {} differs from STA {} at {}", a, ref, k);
-+        }
 +        x.a=a; ++reseeded;
 +      } else if(!frozen.empty()) {
 +        if(!frozen.count(k))logger->error(utl::CTS,2011,"New boundary not present before edit: {}",k);
@@ -11002,10 +10994,10 @@ index c5594391e4..70e10a11c0 100644
    std::vector<std::string> masterNames_;
 diff --git a/src/cts/src/TimingGraphExtractor.cpp b/src/cts/src/TimingGraphExtractor.cpp
 new file mode 100644
-index 0000000000..efa9a75783
+index 0000000000..7f8fb63e02
 --- /dev/null
 +++ b/src/cts/src/TimingGraphExtractor.cpp
-@@ -0,0 +1,1870 @@
+@@ -0,0 +1,1854 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2019-2025, The OpenROAD Authors
 +
@@ -11200,12 +11192,6 @@ index 0000000000..efa9a75783
 +  std::vector<LaunchMember> members;
 +  const unsigned long long w = static_cast<unsigned long long>(kPartition0Weight);
 +  const unsigned long long m = 100ULL * (part.total - 1) + w;
-+  // EXTRACT_PARTITION_BLOCKS=1: same launch count per partition as below, but
-+  // each partition takes one contiguous range of the name order (partition 0
-+  // first), so consecutive launches of a process are name neighbours.
-+  const char* blocks_env = std::getenv("EXTRACT_PARTITION_BLOCKS");
-+  const bool blocks = blocks_env && std::atoi(blocks_env) == 1;
-+  std::vector<size_t> count(part.total, 0);
 +  for (size_t rank = 0; rank < all.size(); ++rank) {
 +    // Number of partition-0 launches among ranks [0, rank) and [0, rank].
 +    const unsigned long long before = rank * w / m;
@@ -11214,17 +11200,7 @@ index 0000000000..efa9a75783
 +        = (after > before)
 +              ? 0
 +              : 1 + static_cast<int>((rank - before) % (part.total - 1));
-+    ++count[owner];
-+    if (!blocks && owner == part.id) {
-+      members.push_back(std::move(all[rank]));
-+    }
-+  }
-+  if (blocks) {
-+    size_t first = 0;
-+    for (int k = 0; k < part.id; ++k) {
-+      first += count[k];
-+    }
-+    for (size_t rank = first; rank < first + count[part.id]; ++rank) {
++    if (owner == part.id) {
 +      members.push_back(std::move(all[rank]));
 +    }
 +  }
