@@ -1,5 +1,5 @@
 diff --git a/src/cts/include/cts/TritonCTS.h b/src/cts/include/cts/TritonCTS.h
-index c8f3f56302..ba9ac7b9df 100644
+index c8f3f56302..49cba1a7d6 100644
 --- a/src/cts/include/cts/TritonCTS.h
 +++ b/src/cts/include/cts/TritonCTS.h
 @@ -43,6 +43,7 @@ struct Tree;
@@ -10,7 +10,7 @@ index c8f3f56302..ba9ac7b9df 100644
  class CtsOptions;
  class TechChar;
  class StaEngine;
-@@ -66,6 +67,41 @@ class TritonCTS
+@@ -66,6 +67,42 @@ class TritonCTS
    void runTritonCts();
    void reportCtsMetrics();
    CtsOptions* getParms() { return options_; }
@@ -23,9 +23,6 @@ index c8f3f56302..ba9ac7b9df 100644
 +  void extractFFGraphFromODB(const std::string& output_file);
 +  // Input port -> register and register -> output port edges.
 +  void extractIOTimingEdgesFromODB(const std::string& output_file);
-+
-+  // Load per-register clock arrival targets (ff_name,target_ns) from CSV.
-+  void loadSkewTargets(const std::string& csv_path);
 +
 +  // Solve the skew-scheduling LP on the graphs named by CTS_FF_TIMING_GRAPH_CSV
 +  // and CTS_IO_TIMING_EDGES_CSV; the targets are kept in memory for the next
@@ -44,6 +41,10 @@ index c8f3f56302..ba9ac7b9df 100644
 +  // STA-guided refinement of the existing clock tree (ClockRefinement.cpp).
 +  void runClockRefinement();
 +
++  // Stage Q metrics after instance moves (incremental placement parasitics);
++  // see relocEvalMetrics in ClockRefinement.cpp.
++  std::string relocEvalMetrics(const std::string& moved, int mode);
++
 +  // Clock-arrival prediction of every register clock pin and clock buffer pin
 +  // with the STA delay kernel (StagePredictor.cpp); rows are written to
 +  // output_csv, the non-buffer boundary seeds to output_csv.boundaries.csv.
@@ -52,7 +53,7 @@ index c8f3f56302..ba9ac7b9df 100644
    TechChar* getCharacterization() { return techChar_.get(); }
    odb::dbBlock* getBlock() { return db_->getChip()->getBlock(); }
    int setClockNets(const char* names);
-@@ -115,6 +151,10 @@ class TritonCTS
+@@ -115,6 +152,10 @@ class TritonCTS
    void destroyClockModNet(sta::Pin* pin_driver);
    void writeClockNetsToDb(TreeBuilder* builder,
                            std::set<odb::dbNet*>& clkLeafNets);
@@ -63,7 +64,7 @@ index c8f3f56302..ba9ac7b9df 100644
    void writeClockNDRsToDb(TreeBuilder* builder);
    int getNetSpacing(odb::dbTechLayer* layer, int width1, int width2);
    void incrementNumClocks() { ++numberOfClocks_; }
-@@ -214,6 +254,7 @@ class TritonCTS
+@@ -214,6 +255,7 @@ class TritonCTS
    utl::Logger* logger_ = nullptr;
    CtsOptions* options_ = nullptr;
    std::unique_ptr<TechChar> techChar_;
@@ -161,7 +162,7 @@ index 86e17de9e8..15f1af4cd2 100644
    std::string getName() const { return netName_; }
 diff --git a/src/cts/src/ClockLatencyEstimator.cpp b/src/cts/src/ClockLatencyEstimator.cpp
 new file mode 100644
-index 0000000000..a7ad12a0af
+index 0000000000..af74fb2f59
 --- /dev/null
 +++ b/src/cts/src/ClockLatencyEstimator.cpp
 @@ -0,0 +1,59 @@
@@ -190,20 +191,20 @@ index 0000000000..a7ad12a0af
 +  // Without hybrid-bond parasitics t_via = 0 and both tiers get the same bound.
 +  const double R = db3d_->getHbtResistance();  // ohms
 +  const double C = db3d_->getHbtCapacitance();  // farads
-+  t_via_ns_ = 0.693 * R * C * 1.0e9;           // convert seconds -> ns
++  t_via_ns_ = 0.693 * R * C * 1.0e9;           // seconds to ns
 +}
 +
 +void ClockLatencyEstimator::estimateAndWrite(const std::string& output_csv,
 +                                              double max_skew_ns)
 +{
-+  // bottom-tier register: t_max = max_skew; upper-tier: max_skew + t_via;
++  // Bottom-tier register: t_max = max_skew; upper-tier: max_skew + t_via;
 +  // t_min = 0 for all registers (a_i >= 0 in the LP).
 +  const double t_max_bottom = max_skew_ns;
 +  const double t_max_upper  = max_skew_ns + t_via_ns_;
 +
 +  std::ofstream f(output_csv);
 +  if (!f.is_open()) {
-+    // Caller (TritonCTS::estimateLeafLatencies) will warn about missing file
++    // The caller (TritonCTS::estimateLeafLatencies) reports the missing file.
 +    return;
 +  }
 +
@@ -226,7 +227,7 @@ index 0000000000..a7ad12a0af
 +}  // namespace cts
 diff --git a/src/cts/src/ClockLatencyEstimator.h b/src/cts/src/ClockLatencyEstimator.h
 new file mode 100644
-index 0000000000..11e65af41e
+index 0000000000..c283811283
 --- /dev/null
 +++ b/src/cts/src/ClockLatencyEstimator.h
 @@ -0,0 +1,42 @@
@@ -255,11 +256,11 @@ index 0000000000..11e65af41e
 +class ClockLatencyEstimator
 +{
 + public:
-+  // Construct with a populated Cts3DDatabase (tiers + HBT parasitic loaded).
++  // db3d: populated Cts3DDatabase (tiers and hybrid-bond parasitics loaded).
 +  explicit ClockLatencyEstimator(Cts3DDatabase* db3d);
 +
-+  // Compute per-FF physical achievability bounds and write CSV.
-+  // max_skew_ns: CTS delay budget per FF for same-tier tree sizing (ns).
++  // Writes the per-register bounds of the arrival increment to output_csv.
++  // max_skew_ns: clock delay budget per register (ns).
 +  // output_csv:  destination path, format ff_name,tier,t_min_ns,t_max_ns.
 +  void estimateAndWrite(const std::string& output_csv, double max_skew_ns);
 +
@@ -274,10 +275,10 @@ index 0000000000..11e65af41e
 +}  // namespace cts
 diff --git a/src/cts/src/ClockRefinement.cpp b/src/cts/src/ClockRefinement.cpp
 new file mode 100644
-index 0000000000..83d99b4ffa
+index 0000000000..cc6cd3547b
 --- /dev/null
 +++ b/src/cts/src/ClockRefinement.cpp
-@@ -0,0 +1,1088 @@
+@@ -0,0 +1,1128 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -318,7 +319,7 @@ index 0000000000..83d99b4ffa
 +//   guard endpoints (CTS_GUARD_ENDPOINTS_TSV): slack >= CTS_GUARD_MARGIN_PS or
 +//             >= its start slack
 +// Budget: CTS_REFINE_MAX_CAND evaluations or CTS_REFINE_MAX_SEC seconds.
-+// Options (defaults = the values used for the reported results):
++// Options (default values in parentheses):
 +//   CTS_REFINE_KINDS                 comma list of bypass,sink,resize
 +//   CTS_REFINE_MAX_CAND (60), CTS_REFINE_MAX_SEC (2400)
 +//   CTS_REFINE_MAX_SETUP_PER_HOLD (2), CTS_REFINE_RESIZE_RADIUS_UM (3)
@@ -346,6 +347,7 @@ index 0000000000..83d99b4ffa
 +#include <fstream>
 +#include <functional>
 +#include <map>
++#include <memory>
 +#include <set>
 +#include <sstream>
 +#include <string>
@@ -381,7 +383,7 @@ index 0000000000..83d99b4ffa
 +constexpr double kSetupWnsTolPs = 0.5;
 +constexpr double kSetupTnsBudgetFrac = 0.01;
 +constexpr double kGuardMarginPs = 10.0;
-+// Option defaults (values used for the reported results).
++// Default options.
 +constexpr const char* kDefaultKinds = "bypass,sink,resize";
 +constexpr int kDefaultMaxCand = 60;
 +constexpr double kDefaultMaxSec = 2400;
@@ -501,8 +503,8 @@ index 0000000000..83d99b4ffa
 +    }
 +  }
 +  // Tree edges: only buffers whose input net is driven by another clock buffer
-+  // or by a clock source are part of the clock tree.  We mark reachability
-+  // from the SDC clock pins.
++  // or by a clock source are part of the clock tree.  Reachability is
++  // traced from the SDC clock pins.
 +  std::unordered_set<odb::dbNet*> clockNets;
 +  {
 +    std::vector<odb::dbNet*> q;
@@ -1365,13 +1367,52 @@ index 0000000000..83d99b4ffa
 +               candId, kept, fin.st, fin.sw, fin.ht, fin.hw, fin.slew, fin.cap, fin.fo, selSec);
 +}
 +
++// Stage Q (buffer_relocation.tcl): whole-design setup/hold TNS/WNS (ps) after instance moves, with the incremental
++// placement parasitics of the refinement (sel::Eval).  moved = names of the instances moved (or moved back) since the
++// previous call, separated by blanks.  mode 0: whole-design estimation (first call), 1: re-estimate only the nets
++// on a pin of a moved instance, 2: end (disable incremental parasitics, returns "").  Returns "st sw ht hw".
++static std::unique_ptr<sel::Eval> g_relocEval;
++std::string relocEvalMetrics(odb::dbDatabase* db,
++                             sta::dbSta* sta,
++                             sta::dbNetwork* network,
++                             est::EstimateParasitics* est,
++                             utl::Logger* logger,
++                             const std::string& moved,
++                             int mode)
++{
++  if (mode == 2) {
++    if (g_relocEval) {
++      g_relocEval->finish();
++      g_relocEval.reset();
++    }
++    return "";
++  }
++  if (!g_relocEval) {
++    g_relocEval = std::make_unique<sel::Eval>(db, sta, network, est, logger, "", "");
++  }
++  odb::dbBlock* block = db->getChip()->getBlock();
++  std::istringstream ss(moved);
++  std::string name;
++  while (ss >> name) {
++    odb::dbInst* inst = block->findInst(name.c_str());
++    if (inst == nullptr) {
++      logger->error(utl::CTS, 2130, "relocEvalMetrics: instance {} not found", name);
++    }
++    g_relocEval->touchInst(inst);
++  }
++  g_relocEval->rc(mode == 0);
++  double st, sw, ht, hw;
++  g_relocEval->tnsWns(st, sw, ht, hw, false);
++  return fmt::format("{:.17g} {:.17g} {:.17g} {:.17g}", st, sw, ht, hw);
++}
++
 +}  // namespace cts
 diff --git a/src/cts/src/Cts3DDatabase.cpp b/src/cts/src/Cts3DDatabase.cpp
 new file mode 100644
-index 0000000000..cf0ed7e29a
+index 0000000000..6009fa215e
 --- /dev/null
 +++ b/src/cts/src/Cts3DDatabase.cpp
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,431 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2019-2025, The OpenROAD Authors
 +//
@@ -1392,7 +1433,7 @@ index 0000000000..cf0ed7e29a
 +
 +using utl::CTS;
 +
-+// Static empty vector for out-of-range tier queries
++// Returned for out-of-range tier queries.
 +const std::vector<odb::dbInst*> Cts3DDatabase::emptyInstVec_;
 +
 +Cts3DDatabase::Cts3DDatabase(odb::dbDatabase* db, utl::Logger* logger)
@@ -1442,8 +1483,8 @@ index 0000000000..cf0ed7e29a
 +    const std::string masterName = master->getName();
 +    int tier = tierFromMasterName(masterName);
 +
-+    // No ODB z_ dependency: tier determined solely by master name suffix.
-+    // All 3D platform cells (stdcell + macro) have _upper/_bottom suffix.
++    // The tier is taken only from the master name; every cell of the 3D
++    // platforms (standard cells and macros) has an _upper or _bottom suffix.
 +    if (tier < 0) {
 +      debugPrint(logger_, CTS, "3DDB", 1,
 +          "Instance '{}' master '{}' has no tier suffix, skipping",
@@ -1465,18 +1506,17 @@ index 0000000000..cf0ed7e29a
 +                "Cts3DDatabase populated: bottom={}, upper={}, total={}",
 +                bottomCount, upperCount, bottomCount + upperCount);
 +
-+  // Load HB parasitic after tier assignment
 +  loadHybridBondParasitics();
 +}
 +
-+// Hybrid-bond parasitics from the tech LEF.
++// Hybrid-bond parasitics from the technology.
 +// R: hb_layer RESISTANCE (ohms per cut for a CUT layer); default 0.02 ohm.
-+// C: a CUT layer has no capacitance in LEF -> 0, so the via delay
++// C: LEF defines no capacitance for a CUT layer, so C = 0 and the via delay
 +//    0.693 * R * C is 0.
 +void Cts3DDatabase::loadHybridBondParasitics()
 +{
-+  const double DEFAULT_HB_RES = 0.02;       // Ω per cut (from tech LEF RESISTANCE)
-+  const double DEFAULT_HB_CAP = 0.0;        // F (not available in tech LEF for CUT layers)
++  const double DEFAULT_HB_RES = 0.02;       // ohms per cut
++  const double DEFAULT_HB_CAP = 0.0;        // F (no LEF capacitance for CUT layers)
 +
 +  odb::dbTech* tech = db_->getTech();
 +  if (tech == nullptr) {
@@ -1488,7 +1528,7 @@ index 0000000000..cf0ed7e29a
 +    return;
 +  }
 +
-+  // Find hb_layer (TYPE CUT) in tech LEF
++  // hb_layer (TYPE CUT) of the technology.
 +  odb::dbTechLayer* hb_layer = nullptr;
 +  for (odb::dbTechLayer* layer : tech->getLayers()) {
 +    if (layer->getName() == "hb_layer") {
@@ -1508,7 +1548,7 @@ index 0000000000..cf0ed7e29a
 +    return;
 +  }
 +
-+  // Read R from tech LEF (dbTechLayer::getResistance() returns ohms per cut for CUT layers)
++  // dbTechLayer::getResistance() is in ohms per cut for a CUT layer.
 +  hbtRes_ = hb_layer->getResistance();
 +  if (hbtRes_ <= 0.0) {
 +    logger_->warn(CTS, 544,
@@ -1517,7 +1557,6 @@ index 0000000000..cf0ed7e29a
 +    hbtRes_ = DEFAULT_HB_RES;
 +  }
 +
-+  // C not available in tech LEF for CUT layers → 0
 +  hbtCap_ = DEFAULT_HB_CAP;
 +
 +  // Elmore 50% delay: t_via = 0.693 * R * C
@@ -1676,7 +1715,7 @@ index 0000000000..cf0ed7e29a
 +    if (db_inst != nullptr) {
 +      tier = getInstTier(db_inst);
 +    } else {
-+      // Fallback to ClockInst tier (for buffers not yet in ODB)
++      // Buffer not yet in the database: tier of the ClockInst.
 +      tier = inst->getTier();
 +    }
 +    if (tier == 0) {
@@ -1720,29 +1759,6 @@ index 0000000000..cf0ed7e29a
 +  inst.setTier(tier);
 +}
 +
-+// True if a net connects instances of both tiers.
-+bool Cts3DDatabase::isCrossTierNet(odb::dbNet* net) const
-+{
-+  if (net == nullptr) {
-+    return false;
-+  }
-+  bool hasTier0 = false;
-+  bool hasTier1 = false;
-+  for (odb::dbITerm* iterm : net->getITerms()) {
-+    odb::dbInst* inst = iterm->getInst();
-+    const int tier = getInstTier(inst);
-+    if (tier == 0) {
-+      hasTier0 = true;
-+    } else if (tier == 1) {
-+      hasTier1 = true;
-+    }
-+    if (hasTier0 && hasTier1) {
-+      return true;
-+    }
-+  }
-+  return false;
-+}
-+
 +double Cts3DDatabase::getResPerDBU(int tier) const
 +{
 +  if (tier < 0 || tier > 1) {
@@ -1767,23 +1783,17 @@ index 0000000000..cf0ed7e29a
 +  }
 +}
 +
-+void Cts3DDatabase::setHbtParasitic(double resistance, double capacitance)
-+{
-+  hbtRes_ = resistance;
-+  hbtCap_ = capacitance;
-+}
-+
 +// Wire length with the same delay as a hybrid-bond via (R*C over the wire
 +// r*c), or with the same resistance when no capacitance is available.
 +double Cts3DDatabase::getHbtEquivalentDistance(double wireResPerUnit,
 +                                               double wireCapPerUnit) const
 +{
 +  if (wireResPerUnit <= 0.0 || hbtRes_ <= 0.0) {
-+    return 0.0;  // Need at least R values
++    return 0.0;
 +  }
 +
-+  // RC: delay_HB = R_HB * C_HB, delay_wire ~ r * c * L^2
-+  //     -> L = sqrt(R_HB * C_HB / (r * c))
++  // delay_HB = R_HB * C_HB and delay_wire ~ r * c * L^2, so
++  // L = sqrt(R_HB * C_HB / (r * c)).
 +  if (hbtCap_ > 0.0 && wireCapPerUnit > 0.0) {
 +    const double delay_hb = hbtRes_ * hbtCap_;
 +    const double delay_wire_per_unit = wireResPerUnit * wireCapPerUnit;
@@ -1791,74 +1801,11 @@ index 0000000000..cf0ed7e29a
 +    return std::sqrt(delay_hb / delay_wire_per_unit);
 +  }
 +
-+  // R only: R_HB = r * L -> L = R_HB / r
++  // Resistance only: R_HB = r * L, so L = R_HB / r.
 +  return hbtRes_ / wireResPerUnit;
 +}
 +
-+int Cts3DDatabase::getNumInstancesOnTier(int tier) const
-+{
-+  if (tier < 0 || tier > 1) {
-+    return 0;
-+  }
-+  return static_cast<int>(instsPerTier_[tier].size());
-+}
-+
-+void Cts3DDatabase::reportStats() const
-+{
-+  logger_->info(CTS, 353,
-+                "Cts3DDatabase stats: bottom={}, upper={}",
-+                getNumInstancesOnTier(0), getNumInstancesOnTier(1));
-+}
-+
 +// --- Pre-CTS skew targets ---
-+
-+// Per-register arrival targets (ns) written by the LP solver:
-+// ff_name,target_ns[,tier].
-+void Cts3DDatabase::loadSkewTargets(const std::string& csv_path)
-+{
-+  skewTargetMap_.clear();
-+  std::ifstream file(csv_path);
-+  if (!file.is_open()) {
-+    logger_->warn(CTS, 397, "Cannot open skew targets file: {}", csv_path);
-+    return;
-+  }
-+
-+  std::string line;
-+  // Skip header
-+  if (!std::getline(file, line)) {
-+    logger_->warn(CTS, 398, "Empty skew targets file: {}", csv_path);
-+    return;
-+  }
-+
-+  int count = 0;
-+  int nonzero = 0;
-+  while (std::getline(file, line)) {
-+    std::istringstream ss(line);
-+    std::string ff_name, target_str, tier_str;
-+    std::getline(ss, ff_name, ',');
-+    std::getline(ss, target_str, ',');
-+    std::getline(ss, tier_str, ',');
-+
-+    if (ff_name.empty() || target_str.empty()) {
-+      continue;
-+    }
-+
-+    try {
-+      double target = std::stod(target_str);
-+      skewTargetMap_[ff_name] = target;
-+      count++;
-+      if (std::abs(target) > 1e-6) {
-+        nonzero++;
-+      }
-+    } catch (const std::exception&) {
-+      // Skip malformed rows
-+    }
-+  }
-+
-+  logger_->info(CTS, 399,
-+                "Loaded {} skew targets ({} non-zero) from {}",
-+                count, nonzero, csv_path);
-+}
 +
 +double Cts3DDatabase::getSkewTarget(const std::string& ff_name) const
 +{
@@ -1899,10 +1846,10 @@ index 0000000000..cf0ed7e29a
 +}  // namespace cts
 diff --git a/src/cts/src/Cts3DDatabase.h b/src/cts/src/Cts3DDatabase.h
 new file mode 100644
-index 0000000000..69c932dfc3
+index 0000000000..543e31b1d3
 --- /dev/null
 +++ b/src/cts/src/Cts3DDatabase.h
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,146 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2019-2025, The OpenROAD Authors
 +//
@@ -1930,89 +1877,77 @@ index 0000000000..69c932dfc3
 + public:
 +  Cts3DDatabase(odb::dbDatabase* db, utl::Logger* logger);
 +
-+  // Load tier info from ODB (call once after design is loaded)
-+  // Scans all instances, determines tier from master name suffix
-+  // (__upper -> tier 1, __bottom -> tier 0)
++  // Assigns a tier to every instance of the block from its master name
++  // (_upper: tier 1, _bottom: tier 0).  Call once after the design is loaded.
 +  void populate();
 +
-+  // Load HB parasitic from tech definition
-+  // Reads hb_layer via R/C values from set_layer_rc -via hb_layer
++  // Reads the hybrid-bond via resistance of hb_layer from the technology
++  // (LEF RESISTANCE, or the value set by set_layer_rc -via hb_layer).
 +  void loadHybridBondParasitics();
 +
 +  // --- Instance tier queries ---
 +
-+  // Get tier of a dbInst (returns cached value, -1 if unknown)
++  // Tier of an instance (cached; -1 if unknown).
 +  int getInstTier(odb::dbInst* inst) const;
 +
-+  // Get all instances on a given tier (0 or 1)
++  // All instances on a given tier (0 or 1).
 +  const std::vector<odb::dbInst*>& getInstancesOnTier(int tier) const;
 +
 +  // --- Buffer master mapping ---
 +
-+  // Map a buffer master name to tier-specific variant.
-+  // First checks explicit bottom<->upper pair set via setTierBufferPair(),
-+  // then falls back to suffix substitution (_bottom <-> _upper).
-+  // e.g. with pair ("BUF_X4_bottom", "BUF_X4_upper"):
-+  //   "BUF_X4_bottom" + tier=1 -> "BUF_X4_upper"
-+  // e.g. suffix fallback (no pair set):
-+  //   "BUFx4_ASAP7_75t_R_bottom" + tier=1 -> "BUFx4_ASAP7_75t_R_upper"
++  // Tier-specific variant of a buffer master.  The explicit bottom/upper pair
++  // set by setTierBufferPair() is checked first, then the _bottom/_upper
++  // suffix is substituted.  Examples:
++  //   pair ("BUF_X4_bottom", "BUF_X4_upper"): "BUF_X4_bottom", tier 1
++  //     gives "BUF_X4_upper";
++  //   no pair: "BUFx4_ASAP7_75t_R_bottom", tier 1 gives
++  //     "BUFx4_ASAP7_75t_R_upper".
 +  std::string getBufferForTier(const std::string& baseMaster,
 +                               int targetTier) const;
 +
-+  // Register explicit bottom/upper buffer pair.
-+  // Bypasses suffix-only guessing when cell names differ across tech nodes.
-+  // Call after populate(), before tree building.
-+  // e.g. setTierBufferPair("BUF_X4_bottom", "BUF_X4_upper")
++  // Registers an explicit bottom/upper buffer pair, used when the cell names
++  // of the two tiers differ (two technologies).  Call after populate() and
++  // before tree building, e.g. setTierBufferPair("BUF_X4_bottom",
++  // "BUF_X4_upper").
 +  void setTierBufferPair(const std::string& bottomBuf,
 +                         const std::string& upperBuf);
 +
 +  // --- Dominant tier computation ---
 +
-+  // Majority voting over a set of ClockInst pointers
++  // Majority tier of a set of clock instances.
 +  int getDominantTier(const std::vector<ClockInst*>& insts) const;
 +
-+  // Majority voting over locations using a location-to-sink map
++  // Majority tier of the sinks at a set of locations (location-to-sink map).
 +  int getDominantTier(
 +      const std::vector<Point<double>>& locs,
 +      const std::map<Point<double>, ClockInst*>& locToSink) const;
 +
-+  // Majority voting over all sinks in a Clock object
++  // Majority tier of all sinks of a clock.
 +  int getDominantTierFromClock(const Clock& clock) const;
 +
 +  // --- ClockInst tier management ---
-+  // Set the tier of a CTS-created ClockInst
-+  // (for buffers created during tree building, before writeDataToDb)
++  // Sets the tier of a clock instance created during tree building (before
++  // it is written to the database).
 +  void setClockInstTier(ClockInst& inst, int tier);
 +
-+  // --- Cross-tier net detection ---
-+
-+  // Returns true if a net connects instances on different tiers
-+  bool isCrossTierNet(odb::dbNet* net) const;
-+
-+  // --- Per-tier wire parasitic ---
-+  // Extension point for 3D-aware parasitic estimation
++  // --- Per-tier wire parasitics ---
 +
 +  double getResPerDBU(int tier) const;
 +  double getCapPerDBU(int tier) const;
 +  void setWireRC(int tier, double resPerDBU, double capPerDBU);
 +
-+  // --- Hybrid Bond (HBT) parasitic ---
++  // --- Hybrid-bond (HBT) parasitics ---
 +
 +  double getHbtResistance() const { return hbtRes_; }
 +  double getHbtCapacitance() const { return hbtCap_; }
-+  void setHbtParasitic(double resistance, double capacitance);
 +
-+  // Convert HB R×C delay to equivalent wire distance
-+  // For use in clustering: penalize cross-tier pairs by this distance
-+  // Physics: HB lumped RC vs wire distributed RC (delay ∝ L²)
-+  // Formula: L = sqrt((R_HB × C_HB) / (r × c))
-+  // Returns: equivalent distance in μm (same units as wireResPerUnit)
++  // Wire length whose distributed RC delay equals the lumped RC delay of one
++  // hybrid-bond via: L = sqrt((R_HB * C_HB) / (r * c)); L = R_HB / r when no
++  // capacitance is available.  L is in the length unit of wireResPerUnit.
 +  double getHbtEquivalentDistance(double wireResPerUnit,
 +                                  double wireCapPerUnit) const;
 +
-+  // --- LP skew targets ---
-+  // Load per-FF arrival time targets from LP solver
-+  void loadSkewTargets(const std::string& csv_path);
++  // --- LP skew targets (set by the LP solver) ---
 +  double getSkewTarget(const std::string& ff_name) const;
 +  double getSkewTarget(odb::dbInst* inst) const;
 +  bool hasSkewTargets() const { return !skewTargetMap_.empty(); }
@@ -2023,57 +1958,50 @@ index 0000000000..69c932dfc3
 +  const std::unordered_map<std::string, double>& getSkewTargetMap() const {
 +    return skewTargetMap_;
 +  }
-+  // Direct in-memory target setting (no CSV)
 +  void clearSkewTargets() { skewTargetMap_.clear(); }
 +  void setSkewTarget(const std::string& ff_name, double arrival_ns)
 +  {
 +    skewTargetMap_[ff_name] = arrival_ns;
 +  }
 +
-+  // --- Statistics ---
-+
-+  int getNumInstancesOnTier(int tier) const;
-+  void reportStats() const;
-+
 + private:
-+  // Determine tier from master name suffix
++  // Tier from the master name (_upper: 1, _bottom: 0, else -1).
 +  static int tierFromMasterName(const std::string& name);
 +
-+  // String suffix helper
 +  static bool hasSuffix(const std::string& name, const std::string& suffix);
 +
 +  odb::dbDatabase* db_;
 +  utl::Logger* logger_;
 +
-+  // Cached tier assignments (populated once from ODB)
++  // Tier of every instance, filled by populate().
 +  std::unordered_map<odb::dbInst*, int> instTierMap_;
 +  std::array<std::vector<odb::dbInst*>, 2> instsPerTier_;
 +  static const std::vector<odb::dbInst*> emptyInstVec_;
 +
-+  // Per-tier wire RC (initially same for both tiers, can be split later)
++  // Wire RC per tier.
 +  std::array<double, 2> resPerDBU_ = {0.0, 0.0};
 +  std::array<double, 2> capPerDBU_ = {0.0, 0.0};
 +
-+  // Explicit bottom/upper buffer pair for cross-tech mapping.
-+  // Set via setTierBufferPair(); empty strings mean "use suffix fallback only".
++  // Explicit bottom/upper buffer pair (setTierBufferPair()); empty strings:
++  // suffix substitution only.
 +  std::string bottomBufName_;
 +  std::string upperBufName_;
 +
-+  // Hybrid Bond parasitic values (not TSV - this is face-to-face bonding)
++  // Face-to-face hybrid-bond via parasitics.
 +  double hbtRes_ = 0.0;   // ohms
 +  double hbtCap_ = 0.0;   // farads
 +
-+  // Pre-CTS skew targets: ff_instance_name -> target arrival offset (ns)
++  // Pre-CTS skew targets: register instance name to target arrival offset (ns).
 +  std::unordered_map<std::string, double> skewTargetMap_;
 +};
 +
 +}  // namespace cts
 diff --git a/src/cts/src/CtsSkewLpSolver.cpp b/src/cts/src/CtsSkewLpSolver.cpp
 new file mode 100644
-index 0000000000..b661fd35fb
+index 0000000000..b6e850359f
 --- /dev/null
 +++ b/src/cts/src/CtsSkewLpSolver.cpp
-@@ -0,0 +1,989 @@
+@@ -0,0 +1,974 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -2186,15 +2114,6 @@ index 0000000000..b661fd35fb
 +                  2027,
 +                  "STA-guarded constraints retained for physical admission: {}",
 +                  manifest);
-+  }
-+  // The hold policy is fixed to "nonregression"; the variable is accepted for
-+  // compatibility but any other value is an error.
-+  const char* explicit_policy = std::getenv("CTS_HOLD_POLICY");
-+  if (explicit_policy && std::string(explicit_policy) != "nonregression") {
-+    logger_->error(utl::CTS,
-+                   974,
-+                   "CTS_HOLD_POLICY must be nonregression (got {})",
-+                   explicit_policy);
 +  }
 +  // Header: from_ff,to_ff,slack_max_ns,slack_min_ns,arrival_max_ns,
 +  //         arrival_min_ns,required_max_ns,required_min_ns,from_x,from_y,
@@ -2696,13 +2615,7 @@ index 0000000000..b661fd35fb
 +    ++n_wns_ct;
 +  }
 +
-+  const double residual_weight
-+      = std::getenv("CTS_HOLD_RESIDUAL_WEIGHT")
-+            ? std::atof(std::getenv("CTS_HOLD_RESIDUAL_WEIGHT"))
-+            : 1.0;
-+  if (!std::isfinite(residual_weight) || residual_weight < 0) {
-+    logger_->error(utl::CTS, 2012, "Invalid hold residual weight");
-+  }
++  constexpr double residual_weight = 1.0;  // weight of the hold residuals in both phases
 +  logger_->info(utl::CTS,
 +                2015,
 +                "Hold residual objective weight {} in both phases",
@@ -3065,7 +2978,7 @@ index 0000000000..b661fd35fb
 +}  // namespace cts
 diff --git a/src/cts/src/CtsSkewLpSolver.h b/src/cts/src/CtsSkewLpSolver.h
 new file mode 100644
-index 0000000000..fc964f752a
+index 0000000000..f8226bd821
 --- /dev/null
 +++ b/src/cts/src/CtsSkewLpSolver.h
 @@ -0,0 +1,161 @@
@@ -3092,7 +3005,7 @@ index 0000000000..fc964f752a
 +//   IO soft     : +-a - w_m <= slack
 +//   WNS         : V_j - W <= 0
 +// Two-phase solve:
-+//   phase A: minimize W (+ hold residuals, tiny regularization) -> W*
++//   phase A: minimize W (+ hold residuals, small regularization); optimum W*
 +//   phase B: minimize sum V_j + lambda sum a_i + weight_io sum w_m + gamma W
 +//            + residual weight sum r, subject to W <= W* (1 + alpha).
 +
@@ -3232,15 +3145,15 @@ index 0000000000..fc964f752a
 +}  // namespace cts
 diff --git a/src/cts/src/EarlyClockCalibration.cpp b/src/cts/src/EarlyClockCalibration.cpp
 new file mode 100644
-index 0000000000..c4ae0ab645
+index 0000000000..c53b274adc
 --- /dev/null
 +++ b/src/cts/src/EarlyClockCalibration.cpp
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,359 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
-+// Clock-shift calibration of the early-clock structures on the Phase-1 reference tree (port of the calibration part
-+// of flow/decision/early_clock.py).  calibrate_structures writes the structures (<outdir>/cands); the probe session
++// Clock-shift calibration of the early-clock structures on the initial (reference) clock tree.
++// calibrate_structures writes the structures (<outdir>/cands); the probe session
 +// evaluates them (early_probe.tcl); calibrate_fit fits the shift model from the probe reports.
 +#include <algorithm>
 +#include <cmath>
@@ -3310,6 +3223,8 @@ index 0000000000..c4ae0ab645
 +    return out;
 +  };
 +  auto distinct = [](const std::vector<std::string>& v) { return std::set<std::string>(v.begin(), v.end()).size(); };
++  // Per tier, leaves sorted by distance to the root: single leaves (near / mid / far), evenly spread sets of 2, 4, 8
++  // and N_CAP leaves for the fit, and offset sets of 3, 6 and 12 leaves held out for validation.
 +  for (int t : {0, 1}) {
 +    auto& L = pool[t];
 +    if (L.empty()) continue;
@@ -3351,7 +3266,7 @@ index 0000000000..c4ae0ab645
 +  return a;
 +}
 +
-+// Gaussian elimination with partial pivoting (early_clock.solve); false when singular
++// Gauss-Jordan elimination with partial pivoting; false when singular
 +bool solve(std::vector<std::vector<double>> A, std::vector<double> B, std::vector<double>& out)
 +{
 +  int n = (int) B.size();
@@ -3359,7 +3274,7 @@ index 0000000000..c4ae0ab645
 +  for (int i = 0; i < n; ++i) { M[i] = A[i]; M[i].push_back(B[i]); }
 +  for (int i = 0; i < n; ++i) {
 +    int p = i;
-+    for (int r = i + 1; r < n; ++r) if (std::fabs(M[r][i]) > std::fabs(M[p][i])) p = r;   // max(): first maximal
++    for (int r = i + 1; r < n; ++r) if (std::fabs(M[r][i]) > std::fabs(M[p][i])) p = r;   // ties: first maximal row
 +    std::swap(M[i], M[p]);
 +    if (std::fabs(M[i][i]) < 1e-12) return false;
 +    for (int r = 0; r < n; ++r) {
@@ -3476,6 +3391,9 @@ index 0000000000..c4ae0ab645
 +  double kh = 0.0;
 +  for (auto& c : common) kh += c.second.second / (double) std::max(1, c.second.first);
 +  kh = kh / (double) common.size();
++  // Member shift model per tier: shift = common + base_term + a + b * n + c * dist + d * dist^2 (n = leaves moved on
++  // that tier, dist = leaf-to-root Manhattan distance in um), least squares on the fit sets; valid when at least two
++  // held-out sets exist and their RMS error is <= 10 ps.
 +  auto feat = [](const Pt& p) { return std::vector<double>{1.0, (double) p.n, p.dist_um, py_pow(p.dist_um, 2.0)}; };
 +  J fit = J::Obj();
 +  for (int t : {0, 1}) {
@@ -3592,14 +3510,14 @@ index 0000000000..c4ae0ab645
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyClockGroups.cpp b/src/cts/src/EarlyClockGroups.cpp
 new file mode 100644
-index 0000000000..e58a81d193
+index 0000000000..82d65f577f
 --- /dev/null
 +++ b/src/cts/src/EarlyClockGroups.cpp
-@@ -0,0 +1,809 @@
+@@ -0,0 +1,810 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
-+// Early-group selection (port of select_early_groups of flow/decision/early_clock.py): construction gains on the
++// Early-group selection: construction gains on the
 +// exact replay, agglomeration on the 8-nearest-neighbour graph, per-tier prefix selection with repair, hold-WNS
 +// front cover, tier search.  Writes plan.tsv, membership.csv, groups.csv, clusters.csv, prefix.csv, pred_shift.csv,
 +// regs_debug.csv, summary.json into <outdir>.
@@ -3643,7 +3561,8 @@ index 0000000000..e58a81d193
 +  bool cover = false;
 +};
 +
-+// evaluation summary of a cluster list (st/sw/ht/hw/hp/phi are numpy floats, x a Python float, nh an int)
++// evaluation summary of a cluster list; summ_json rounds st/sw/ht/hw/hp/phi with scaled (rint) rounding and x with
++// decimal rounding
 +struct Summ { double st, sw, ht, hw, hp, x, phi; int nh; };
 +J summ_json(const Summ& s)
 +{
@@ -3837,7 +3756,7 @@ index 0000000000..e58a81d193
 +  }
 +  // ------------------------------------------------------------ step 1
 +  auto t1 = std::chrono::steady_clock::now();
-+  // per-register construction gains in parallel slots (result independent of the thread count, RT2b)
++  // per-register construction gains in parallel slots (result independent of the thread count)
 +  std::vector<double> g1(P, -INFINITY);
 +  {
 +    const int nth = std::max(1, early_threads());
@@ -3882,7 +3801,7 @@ index 0000000000..e58a81d193
 +  TM.emplace_back("step1_s", py_round(secs_since(t1), 2));
 +  // ------------------------------------------------------------ step 2
 +  auto t2 = std::chrono::steady_clock::now();
-+  std::map<int, Cl> alive;   // ascending id = dict insertion order
++  std::map<int, Cl> alive;   // ascending id = creation order
 +  long merges = 0, pops = 0;
 +  bool budget_hit = false;
 +  std::map<std::string, long> rej{{"size", 0}, {"dmax", 0}, {"tier", 0}, {"syn", 0}};
@@ -3891,7 +3810,7 @@ index 0000000000..e58a81d193
 +  std::unordered_map<int, int> own;
 +  for (auto& kv : alive) { adj[kv.first]; own[kv.second.mem[0]] = kv.first; }
 +  struct HeapEntry { double pc; int a, b; };
-+  auto heap_less = [](const HeapEntry& x, const HeapEntry& y) {   // priority_queue: greatest first -> invert
++  auto heap_less = [](const HeapEntry& x, const HeapEntry& y) {   // inverted: smallest (pc, a, b) on top
 +    if (x.pc != y.pc) return x.pc > y.pc;
 +    if (x.a != y.a) return x.a > y.a;
 +    return x.b > y.b;
@@ -4006,7 +3925,7 @@ index 0000000000..e58a81d193
 +        int k = st.memb[i];
 +        if (!(st.act[k] && st.gt[k] == t)) continue;
 +        double dist = (std::fabs(st.cx[k] - (double) R.rx) + std::fabs(st.cy[k] - (double) R.ry)) / 1000.0;
-+        double mt = f.a + f.b * (double) nt + f.c * dist + f.d * (dist * dist);   // array ** 2 = square
++        double mt = f.a + f.b * (double) nt + f.c * dist + f.d * (dist * dist);   // squared by multiplication
 +        st.d[i] = BASE_I[i] + mt + k_per_hub * (double) nh - tgt[i];
 +      }
 +    }
@@ -4407,14 +4326,15 @@ index 0000000000..e58a81d193
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyClockReplay.cpp b/src/cts/src/EarlyClockReplay.cpp
 new file mode 100644
-index 0000000000..4d813e6b03
+index 0000000000..c44099ae27
 --- /dev/null
 +++ b/src/cts/src/EarlyClockReplay.cpp
-@@ -0,0 +1,893 @@
+@@ -0,0 +1,894 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
-+// Port of flow/decision/early_model.py (load_replay, HBT, scope).  See EarlyClockReplay.h.
++// Dump and graph loading, the stored-check replay, the hybrid-bond delay term and the scope view.
++// See EarlyClockReplay.h.
 +#include "EarlyClockReplay.h"
 +
 +#include <algorithm>
@@ -4555,7 +4475,7 @@ index 0000000000..4d813e6b03
 +  size_t cap = 0;
 +  ssize_t len;
 +  std::vector<std::pair<const char*, const char*>> f;
-+  // FF->FF checks
++  // FF-to-FF checks
 +  std::string ffp = join_path(gdir, "pre_cts_ff_timing_graph.csv");
 +  FILE* fp = std::fopen(ffp.c_str(), "r");
 +  if (!fp) fail("cannot read " + ffp);
@@ -4603,7 +4523,7 @@ index 0000000000..4d813e6b03
 +
 +// ------------------------------------------------------------------------------------------------ replay
 +namespace {
-+// np.argsort(key, kind='stable') + np.bincount -> CSR (positions grouped by key)
++// Stable bucket sort of positions by key into CSR form: order[ptr[k] .. ptr[k + 1]) lists the positions of key k
 +void csr(const std::vector<int64_t>& key, int64_t nkeys, std::vector<int64_t>& order, std::vector<int64_t>& ptr)
 +{
 +  ptr.assign(nkeys + 1, 0);
@@ -4641,7 +4561,7 @@ index 0000000000..4d813e6b03
 +    R.TI.push_back((int) to_int(r[c_tier])); R.CAP.push_back(to_double(r[c_cap])); R.DOM.push_back(r[c_clock]);
 +    stock[r[c_sink]] = r[c_leaf];
 +  }
-+  for (int i = 0; i < R.P; ++i) R.rid[R.reg[i]] = i;   // last wins, as the dict comprehension
++  for (int i = 0; i < R.P; ++i) R.rid[R.reg[i]] = i;   // duplicate register names: the last index wins
 +  // group order = leaf order of the membership file (sorted by int)
 +  {
 +    std::set<std::string> leaves;
@@ -4684,7 +4604,7 @@ index 0000000000..4d813e6b03
 +  if (!fixed_regs.empty())
 +    for (auto& l : read_lines(fixed_regs)) { std::string s = strip(l); if (!s.empty()) FIXED.push_back(s); }
 +  R.F = (int) FIXED.size();
-+  for (int j = 0; j < R.F; ++j) R.rid.emplace(FIXED[j], R.P + j);   // setdefault
++  for (int j = 0; j < R.F; ++j) R.rid.emplace(FIXED[j], R.P + j);   // existing entries are kept
 +  // every register named by a stored check stays in the replay
 +  const Graph& g = *load_graph(join_path(ref, "G/results"));
 +  {
@@ -4904,7 +4824,7 @@ index 0000000000..4d813e6b03
 +  for (auto& p : pts) { xmin = std::min(xmin, p.first); xmax = std::max(xmax, p.first); ymin = std::min(ymin, p.second); ymax = std::max(ymax, p.second); }
 +  double w = (xmax - xmin) / 1000.0, h = (ymax - ymin) / 1000.0;
 +  double a = w + h, b = 0.7124 * std::sqrt((double) pts.size() * w * h);
-+  return b > a ? b : a;   // Python max(a, b)
++  return b > a ? b : a;
 +}
 +
 +namespace {
@@ -5209,7 +5129,7 @@ index 0000000000..4d813e6b03
 +  for (auto& r : rows.rows) if (r[c_level] == "1") l1.push_back(&r);
 +  Tree tree = load_tree(dump, true);
 +  Sinks sk = load_sinks(dump);
-+  // root: clock-port-driven buffer with the most register sinks on regular leaves; ties -> larger name
++  // root: clock-port-driven buffer with the most register sinks on regular leaves; ties: larger name
 +  std::map<std::string, long> cnt;
 +  for (auto& key : sk.order) {
 +    auto& r = sk.rows[key];
@@ -5306,16 +5226,16 @@ index 0000000000..4d813e6b03
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyClockReplay.h b/src/cts/src/EarlyClockReplay.h
 new file mode 100644
-index 0000000000..9ff6d48558
+index 0000000000..4d3431af7d
 --- /dev/null
 +++ b/src/cts/src/EarlyClockReplay.h
 @@ -0,0 +1,210 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
-+// Early-clock decision data: the Phase-1 tree dump, the stage-G graph, the scoped reference view, the exact
-+// stored-check replay (per-endpoint minima under register clock shifts) and the hybrid-bond delay term.
-+// Port of flow/decision/early_model.py; every array order and floating-point operation order is kept.
++// Early-clock decision data: the initial clock tree dump, the extracted timing graph, the scoped reference view,
++// the exact stored-check replay (per-endpoint minima under register clock shifts) and the hybrid-bond delay term.
++// Array orders and floating-point operation orders are fixed, so results are bit-reproducible.
 +#pragma once
 +#include <cstdint>
 +#include <map>
@@ -5373,7 +5293,7 @@ index 0000000000..9ff6d48558
 +};
 +Sinks load_sinks(const std::string& dump);
 +
-+// stage-G graph: FF->FF checks and IO edges (first columns only), names interned in first-appearance order
++// Timing graph: FF-to-FF checks and IO edges (first columns only), names interned in first-appearance order
 +struct Graph
 +{
 +  std::vector<std::string> names;
@@ -5386,7 +5306,7 @@ index 0000000000..9ff6d48558
 +  std::vector<std::string> ports;
 +  std::unordered_map<std::string, int> port_id;
 +};
-+// parsed once per session: the result is cached by directory and file size / mtime (RT2a)
++// parsed once per session: the result is cached by directory and file size / mtime
 +std::shared_ptr<const Graph> load_graph(const std::string& gdir);
 +// worker threads for the per-register batches (env NUM_CORES, default 4)
 +int early_threads();
@@ -5522,27 +5442,27 @@ index 0000000000..9ff6d48558
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyDecision.h b/src/cts/src/EarlyDecision.h
 new file mode 100644
-index 0000000000..5b00f31fae
+index 0000000000..2257d01ca1
 --- /dev/null
 +++ b/src/cts/src/EarlyDecision.h
 @@ -0,0 +1,30 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
-+// Entry points of the early-clock decision (port of flow/decision/early_clock.py).  All functions work on files;
-+// the probe loop (apply candidate -> predict -> undo) runs in Tcl inside the same OpenROAD session.
++// Entry points of the early-clock decision.  All functions work on files;
++// the probe loop (apply candidate, predict, undo) runs in Tcl inside the same OpenROAD session.
 +#pragma once
 +#include <string>
 +
 +namespace cts::early {
 +
-+// calibration structures -> <outdir>/cands/{list.txt,<cfg>.tsv}
++// writes the calibration structures to <outdir>/cands/{list.txt,<cfg>.tsv}
 +void calibrate_structures(const std::string& view, const std::string& plat, const std::string& des, const std::string& dump,
 +                          const std::string& outdir, const std::string& root);
-+// least-squares fit from the probe reports -> <outdir>/calib.json, calib_points.csv
++// least-squares fit from the probe reports; writes <outdir>/calib.json and calib_points.csv
 +void calibrate_fit(const std::string& view, const std::string& plat, const std::string& des, const std::string& dump,
 +                   const std::string& outdir, const std::string& root, const std::string& probe_reports);
-+// early-group selection -> <outdir>/plan.tsv, summary.json, ...; returns the status
++// early-group selection; writes <outdir>/plan.tsv, summary.json and the tables, returns the status
 +std::string early_groups(const std::string& view, const std::string& plat, const std::string& des, const std::string& dump,
 +                         const std::string& calib, const std::string& outdir, const std::string& fixed_regs,
 +                         const std::string& hbt_nets, const std::string& setrc, const std::string& tier_only);
@@ -5558,18 +5478,18 @@ index 0000000000..5b00f31fae
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyHub.cpp b/src/cts/src/EarlyHub.cpp
 new file mode 100644
-index 0000000000..cfb23fb13d
+index 0000000000..88c3caf4e6
 --- /dev/null
 +++ b/src/cts/src/EarlyHub.cpp
 @@ -0,0 +1,398 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
-+// Single-root early-hub candidates (port of the hub part of flow/decision/early_clock.py):
-+//   generate -> <out>/cands/<cid>.tsv, list.txt, gen.csv, gen.json
-+//   measure  -> <out>/measured.csv (from the probe reports arr_<cid>.csv)
-+//   select   -> <out>/plan.tsv, cid, select.json
-+//   multi    -> <out>/plan_k<k>.tsv, prefixes.json
++// Single-root early-hub candidates:
++//   generate: <out>/cands/<cid>.tsv, list.txt, gen.csv, gen.json
++//   measure:  <out>/measured.csv (from the probe reports arr_<cid>.csv)
++//   select:   <out>/plan.tsv, cid, select.json
++//   multi:    <out>/plan_k<k>.tsv, prefixes.json
 +#include <algorithm>
 +#include <atomic>
 +#include <chrono>
@@ -5618,7 +5538,7 @@ index 0000000000..cfb23fb13d
 +  return H.full_delta({g}, {});
 +}
 +
-+// numpy.interp for one value (sorted xp, len >= 1)
++// Piecewise-linear interpolation of one value (sorted xp, len >= 1; end values of fp outside the xp range)
 +double np_interp(double x, const std::vector<double>& xp, const std::vector<double>& fp)
 +{
 +  size_t n = xp.size();
@@ -5715,7 +5635,7 @@ index 0000000000..cfb23fb13d
 +  int P = R.P, G = R.G;
 +  std::vector<double> dist(P);
 +  for (int i = 0; i < P; ++i) dist[i] = (std::fabs(R.X[i] - (double) R.rx) + std::fabs(R.Y[i] - (double) R.ry)) / 1000.0;
-+  // per-register construction gains in parallel slots (result independent of the thread count, RT2b)
++  // per-register construction gains in parallel slots (result independent of the thread count)
 +  std::vector<double> single(P, -INFINITY);
 +  {
 +    const int nth = std::max(1, early_threads());
@@ -5877,7 +5797,7 @@ index 0000000000..cfb23fb13d
 +    row["nonmember_shift_max"] = py_repr(py_round(np_max(dn), 2));
 +    row["pred_gain"] = py_repr(to_double(g[g_pg]));
 +    row["meas_gain"] = py_repr(py_round(e.gain, 1));
-+    row["d_setup_wns"] = py_repr(np_round(e.sw - R.b_sw, 2));   // float - np.float64 -> numpy rounding
++    row["d_setup_wns"] = py_repr(np_round(e.sw - R.b_sw, 2));   // WNS differences use scaled (rint) rounding
 +    row["d_hold_wns"] = py_repr(np_round(e.hw - R.b_hw, 2));
 +    row["ok"] = (e.ok && e.gain > MIN_GAIN) ? "1" : "0";
 +    row["missing_regs"] = std::to_string(miss);
@@ -5929,7 +5849,7 @@ index 0000000000..cfb23fb13d
 +  std::vector<Chosen> chosen;
 +  std::string head;
 +  for (auto& r : passing(t)) {
-+    auto lines = read_lines(join_path(cands_dir, r[cc] + ".tsv"));   // read().splitlines() + strip of blanks
++    auto lines = read_lines(join_path(cands_dir, r[cc] + ".tsv"));   // header + non-blank plan rows
 +    head = lines.at(0);
 +    std::vector<std::string> body;
 +    for (size_t i = 1; i < lines.size(); ++i) if (!strip(lines[i]).empty()) body.push_back(lines[i]);
@@ -5962,17 +5882,18 @@ index 0000000000..cfb23fb13d
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyKDTree.h b/src/cts/src/EarlyKDTree.h
 new file mode 100644
-index 0000000000..ee040a5adc
+index 0000000000..fa6889eb47
 --- /dev/null
 +++ b/src/cts/src/EarlyKDTree.h
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,191 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
-+// Replica of scipy.spatial.cKDTree (scipy 1.13.1, leafsize 16, balanced_tree, compact_nodes, no box) for the
-+// k-nearest-neighbour query with p = 1 and a distance upper bound.  The build uses the same libstdc++ algorithms
-+// (std::nth_element, std::partition, std::min_element, std::max_element) on the index array and the query the same
-+// node / neighbour heaps, so the neighbour sets (ties included) are those of the Python flow.
++// k-d tree (leaf size 16, balanced median split on the widest dimension, node bounds recomputed per node, no
++// periodic box) for k-nearest-neighbour queries with p = 1 and a distance upper bound.  The build partitions the
++// index array with std::nth_element / std::partition (std::min_element / std::max_element for degenerate splits);
++// the query uses a binary min-heap of nodes and a bounded max-heap of neighbours, so the neighbour set, including
++// ties, is fully determined by the input order.
 +#pragma once
 +#include <algorithm>
 +#include <cmath>
@@ -6008,7 +5929,7 @@ index 0000000000..ee040a5adc
 +  struct Node { long start_idx = 0, end_idx = 0, children = 0; int split_dim = -1; double split = 0; long less = -1, greater = -1; };
 +  union Contents { long intdata; const void* ptrdata; };
 +  struct HeapItem { double priority; Contents contents; };
-+  // scipy ckdtree heap (query.cxx)
++  // Binary min-heap on priority with a growable array (capacity 2 * space + 1 on overflow)
 +  struct Heap
 +  {
 +    std::vector<HeapItem> h;
@@ -6158,15 +6079,16 @@ index 0000000000..ee040a5adc
 +}  // namespace cts::early
 diff --git a/src/cts/src/EarlyUtil.h b/src/cts/src/EarlyUtil.h
 new file mode 100644
-index 0000000000..96b6eb9878
+index 0000000000..d558d4e477
 --- /dev/null
 +++ b/src/cts/src/EarlyUtil.h
-@@ -0,0 +1,521 @@
+@@ -0,0 +1,518 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
-+// Shared helpers of the early-clock decision modules: CSV / TSV reading, Python-compatible number formatting
-+// (repr, round, '%.nf'), numpy-compatible pairwise summation, a small JSON value with Python json.dump layout.
++// Shared helpers of the early-clock decision modules: CSV / TSV reading, deterministic number formatting
++// (shortest round-trip, decimal rounding, '%.nf'), pairwise summation and a small JSON value with an indented
++// writer.
 +#pragma once
 +#include <algorithm>
 +#include <charconv>
@@ -6233,11 +6155,6 @@ index 0000000000..96b6eb9878
 +  const char* r = ::realpath(p.c_str(), buf);
 +  return r ? std::string(r) : p;
 +}
-+inline std::string basename_of(const std::string& p)
-+{
-+  auto k = p.rfind('/');
-+  return k == std::string::npos ? p : p.substr(k + 1);
-+}
 +inline std::string dirname_of(const std::string& p)
 +{
 +  auto k = p.rfind('/');
@@ -6273,7 +6190,7 @@ index 0000000000..96b6eb9878
 +  size_t n = std::strlen(p);
 +  return s.size() >= n && s.compare(s.size() - n, n, p) == 0;
 +}
-+// inst of "inst/pin" (rsplit('/', 1)[0])
++// Instance part of "inst/pin" (text before the last '/')
 +inline std::string inst_of(const std::string& pin)
 +{
 +  auto k = pin.rfind('/');
@@ -6299,13 +6216,13 @@ index 0000000000..96b6eb9878
 +  if (e == b || (e && *e)) fail("bad int '" + s + "'");
 +  return v;
 +}
-+// libm pow without compile-time folding (Python scalar ** calls libm pow)
++// libm pow called at run time (no compile-time folding)
 +inline double py_pow(double x, double y)
 +{
 +  static double (*volatile p)(double, double) = std::pow;
 +  return p(x, y);
 +}
-+// Python float.__repr__ (shortest round-trip digits, 'r' layout)
++// Shortest round-trip decimal representation; scientific notation for exponents < -4 or >= 16
 +inline std::string py_repr(double x)
 +{
 +  if (std::isnan(x)) return "nan";
@@ -6341,7 +6258,7 @@ index 0000000000..96b6eb9878
 +  }
 +  return sign + out;
 +}
-+// Python round(float, n): correctly rounded decimal, ties to even
++// Decimal rounding to n digits (correctly rounded, ties to even)
 +inline double py_round(double x, int n)
 +{
 +  if (!std::isfinite(x)) return x;
@@ -6349,7 +6266,7 @@ index 0000000000..96b6eb9878
 +  std::snprintf(buf, sizeof buf, "%.*f", n, x);
 +  return std::strtod(buf, nullptr);
 +}
-+// numpy round(np.float64, n): rint(x * 10**n) / 10**n
++// Scaled rounding to n digits: rint(x * 10^n) / 10^n
 +inline double np_round(double x, int n)
 +{
 +  static const double p10[] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9};
@@ -6363,10 +6280,9 @@ index 0000000000..96b6eb9878
 +  std::snprintf(buf, sizeof buf, f, x);
 +  return buf;
 +}
-+inline std::string fmt_int(long long v) { return std::to_string(v); }
-+// Python int(x) of a float: truncation toward zero
++// Float to integer, truncation toward zero
 +inline long long py_int(double x) { return (long long) x; }
-+// Python a // b for ints (floor division)
++// Integer floor division
 +inline long long py_floordiv(long long a, long long b)
 +{
 +  long long q = a / b;
@@ -6374,7 +6290,7 @@ index 0000000000..96b6eb9878
 +  return q;
 +}
 +
-+// numpy DOUBLE_pairwise_sum of a contiguous float64 block
++// Pairwise summation of a contiguous double block (8 partial sums for n <= 128, halving split above)
 +inline double np_pairwise_sum(const double* a, long n)
 +{
 +  if (n < 8) {
@@ -6396,7 +6312,7 @@ index 0000000000..96b6eb9878
 +  n2 -= n2 % 8;
 +  return np_pairwise_sum(a, n2) + np_pairwise_sum(a + n2, n - n2);
 +}
-+// ndarray.sum(): identity 0.0, then the pairwise sum of every iterator buffer (8192 elements) in order
++// Array sum: start at 0.0, then add the pairwise sum of each 8192-element block in order
 +inline double np_sum(const double* a, long n)
 +{
 +  double s = 0.0;
@@ -6419,7 +6335,7 @@ index 0000000000..96b6eb9878
 +  for (double x : v) if (x > m) m = x;
 +  return m;
 +}
-+// np.median of a float array (sorted copy; even length -> mean of the two middle values)
++// Median (sorted copy; for even length, the mean of the two middle values)
 +inline double np_median(std::vector<double> v)
 +{
 +  if (v.empty()) fail("median of empty array");
@@ -6429,7 +6345,7 @@ index 0000000000..96b6eb9878
 +  double two[2] = {v[n / 2 - 1], v[n / 2]};
 +  return np_sum(two, 2) / 2.0;
 +}
-+// Python sum() of floats: sequential from int 0 (0 + x == x exactly)
++// Sequential left-to-right sum starting from the first element (0.0 for an empty vector)
 +inline double py_sum(const std::vector<double>& v)
 +{
 +  double s = 0.0;
@@ -6478,14 +6394,14 @@ index 0000000000..96b6eb9878
 +  t.header = split_csv_line(lines[0], sep);
 +  for (size_t i = 0; i < t.header.size(); ++i) t.index.emplace(t.header[i], (int) i);
 +  for (size_t i = 1; i < lines.size(); ++i) {
-+    if (lines[i].empty()) continue;   // csv.DictReader skips blank lines
++    if (lines[i].empty()) continue;   // blank lines are skipped
 +    auto f = split_csv_line(lines[i], sep);
-+    while (f.size() < t.header.size()) f.push_back("");   // DictReader restval None
++    while (f.size() < t.header.size()) f.push_back("");   // missing trailing fields are empty
 +    t.rows.push_back(std::move(f));
 +  }
 +  return t;
 +}
-+// csv.writer field (QUOTE_MINIMAL)
++// CSV field, quoted only when it contains a separator, quote or line break
 +inline std::string csv_field(const std::string& s)
 +{
 +  if (s.find_first_of(",\"\r\n") == std::string::npos) return s;
@@ -6501,7 +6417,8 @@ index 0000000000..96b6eb9878
 +}
 +
 +// ------------------------------------------------------------------------------------------------ JSON
-+// JSON value with insertion-ordered objects; dump() reproduces Python json.dump(obj, indent=n).
++// JSON value with insertion-ordered objects; dump() writes one item per line, indented by n spaces per level,
++// control bytes and bytes >= 0x7f escaped as 4-digit unicode escapes, and NaN/Infinity written as literals.
 +struct J
 +{
 +  enum T { NUL, BOOL, INT, DBL, STR, ARR, OBJ } t = NUL;
@@ -6519,7 +6436,7 @@ index 0000000000..96b6eb9878
 +  static J Arr() { J j; j.t = ARR; return j; }
 +  static J Obj() { J j; j.t = OBJ; return j; }
 +  J& push(const J& v) { a.push_back(v); return a.back(); }
-+  // dict assignment: overwrite in place or append
++  // Overwrite an existing key in place or append a new one
 +  J& set(const std::string& k, const J& v)
 +  {
 +    for (auto& kv : o) if (kv.first == k) { kv.second = v; return kv.second; }
@@ -6618,7 +6535,8 @@ index 0000000000..96b6eb9878
 +      if (s[p] == '}') { ++p; return j; }
 +      while (true) {
 +        ws(); J k = parse_string(); ws();
-+        if (s[p] != ':') fail("json: expected ':'"); ++p;
++        if (s[p] != ':') fail("json: expected ':'");
++        ++p;
 +        J v = parse(); j.o.emplace_back(k.s, v); ws();
 +        if (s[p] == ',') { ++p; continue; }
 +        if (s[p] == '}') { ++p; return j; }
@@ -6684,7 +6602,7 @@ index 0000000000..96b6eb9878
 +
 +}  // namespace cts::early
 diff --git a/src/cts/src/HTreeBuilder.cpp b/src/cts/src/HTreeBuilder.cpp
-index 19710ceb81..d336bd01f6 100644
+index 19710ceb81..5131e13707 100644
 --- a/src/cts/src/HTreeBuilder.cpp
 +++ b/src/cts/src/HTreeBuilder.cpp
 @@ -3,16 +3,27 @@
@@ -6715,7 +6633,7 @@ index 19710ceb81..d336bd01f6 100644
  #include "SinkClustering.h"
  #include "TechChar.h"
  #include "TreeBuilder.h"
-@@ -25,6 +36,96 @@ namespace cts {
+@@ -25,6 +36,88 @@ namespace cts {
  
  using utl::CTS;
  
@@ -6756,14 +6674,6 @@ index 19710ceb81..d336bd01f6 100644
 +  const odb::dbMaster* master = inst->getMaster();
 +  return (master != nullptr && master->isBlock())
 +         || isNamedHardMacroMaster(master);
-+}
-+
-+// CTS_LOAD_AWARE_TAPS=1 enables the load-aware tap depth assignment and the
-+// sizing of the shared delay chain stages.
-+bool loadAwareTapsEnabled()
-+{
-+  const char* e = std::getenv("CTS_LOAD_AWARE_TAPS");
-+  return e != nullptr && std::atoi(e) != 0;
 +}
 +
 +// Register name of a clock sink (the sink name without its "/pin" suffix).
@@ -6812,7 +6722,7 @@ index 19710ceb81..d336bd01f6 100644
  Point<double> HTreeBuilder::legalizeOneBuffer(Point<double> bufferLoc,
                                                const std::string& bufferName)
  {
-@@ -54,8 +155,9 @@ void HTreeBuilder::preSinkClustering(
+@@ -54,8 +147,9 @@ void HTreeBuilder::preSinkClustering(
    const std::vector<std::pair<float, float>>& points = sinks;
    if (!secondLevel) {
      clock_.forEachSink([&](ClockInst& inst) {
@@ -6824,7 +6734,7 @@ index 19710ceb81..d336bd01f6 100644
        mapLocationToSink_[normLocation] = &inst;
        if (!fuzzyEqual(inst.getInsertionDelay(), 0.0, 1e-6)) {
          setSinkInsertionDelay(normLocation,
-@@ -172,84 +274,220 @@ void HTreeBuilder::preSinkClustering(
+@@ -172,84 +266,219 @@ void HTreeBuilder::preSinkClustering(
          std::round(bestDiameter / options_->getDbUnits() * wireSegmentUnit_));
    }
  
@@ -6998,8 +6908,7 @@ index 19710ceb81..d336bd01f6 100644
 +            }
 +          }
 +          if (!found) {
-+            // Use the nearest entry: leaving the sink out would leave it
-+            // unconnected.
++            // Otherwise the nearest entry is used, so every sink is mapped.
 +            double bestDist = std::numeric_limits<double>::max();
 +            for (auto& [key, sink] : mapLocationToSink_) {
 +              double d = std::abs(key.getX() - mapPoint.getX())
@@ -7102,7 +7011,7 @@ index 19710ceb81..d336bd01f6 100644
    topLevelSinksClustered_ = std::move(newSinkLocations);
    if (clusterCount) {
      treeBufLevels_++;
-@@ -259,6 +497,37 @@ void HTreeBuilder::preSinkClustering(
+@@ -259,6 +488,37 @@ void HTreeBuilder::preSinkClustering(
                  19,
                  " Total number of sinks after clustering: {}.",
                  topLevelSinksClustered_.size());
@@ -7140,7 +7049,7 @@ index 19710ceb81..d336bd01f6 100644
  }
  
  Point<double> HTreeBuilder::resolveLocationCollision(
-@@ -269,11 +538,7 @@ Point<double> HTreeBuilder::resolveLocationCollision(
+@@ -269,11 +529,7 @@ Point<double> HTreeBuilder::resolveLocationCollision(
    // Collision check and jittering to ensure unique coordinates
    unsigned jitterCount = 0;
    while (true) {
@@ -7153,7 +7062,7 @@ index 19710ceb81..d336bd01f6 100644
      if (mapLocationToSink_.find(checkKey) == mapLocationToSink_.end()) {
        break;
      }
-@@ -352,6 +617,21 @@ void HTreeBuilder::initSinkRegion()
+@@ -352,6 +608,21 @@ void HTreeBuilder::initSinkRegion()
               wireSegmentUnit_);
    // clang-format on
  
@@ -7175,7 +7084,7 @@ index 19710ceb81..d336bd01f6 100644
    preSinkClustering(topLevelSinks, sinkInsts, maxDiameter, clusterSize);
    if (topLevelSinks.size() <= min_clustering_sinks
        || !(options_->getSinkClustering())) {
-@@ -1265,9 +1545,60 @@ void HTreeBuilder::run()
+@@ -1265,9 +1536,60 @@ void HTreeBuilder::run()
    numMaxLeafSinks_ = options_->getNumMaxLeafSinks();
    minLengthSinkRegion_ = techChar_->getMinSegmentLength() * 2;
  
@@ -7237,7 +7146,7 @@ index 19710ceb81..d336bd01f6 100644
      const unsigned numSinksPerSubRegion
          = computeNumberOfSinksPerSubRegion(level);
      double regionWidth, regionHeight;
-@@ -1300,6 +1631,15 @@ void HTreeBuilder::run()
+@@ -1300,6 +1622,15 @@ void HTreeBuilder::run()
      }
    }
  
@@ -7253,7 +7162,7 @@ index 19710ceb81..d336bd01f6 100644
    if (topologyForEachLevel_.empty()) {
      createSingleBufferClockNet();
      treeBufLevels_++;
-@@ -1320,7 +1660,32 @@ void HTreeBuilder::run()
+@@ -1320,7 +1651,32 @@ void HTreeBuilder::run()
    if (options_->getObstructionAware()) {
      legalize();
    }
@@ -7286,7 +7195,7 @@ index 19710ceb81..d336bd01f6 100644
    // clang-format off
    debugPrint(logger_, CTS, "legalizer", 3, "Htree file {} has been generated",
               plotHTree());
-@@ -1329,6 +1694,53 @@ void HTreeBuilder::run()
+@@ -1329,6 +1685,50 @@ void HTreeBuilder::run()
    // clang-format on
  }
  
@@ -7298,9 +7207,6 @@ index 19710ceb81..d336bd01f6 100644
 +
 +  delayTapsEnabled_ = true;
 +  tapMaxDepth_ = kDefaultTapMaxDepth;
-+  if (const char* e = std::getenv("CTS_TAP_MAX_DEPTH")) {
-+    tapMaxDepth_ = std::atoi(e);
-+  }
 +
 +  {
 +    auto hb_t0 = std::chrono::high_resolution_clock::now();
@@ -7340,7 +7246,7 @@ index 19710ceb81..d336bd01f6 100644
  bool HTreeBuilder::isNumberOfSinksTooSmall(unsigned numSinksPerSubRegion) const
  {
    if (options_->getMaxFanout()) {
-@@ -1830,8 +2242,9 @@ void HTreeBuilder::initTopLevelSinks(
+@@ -1830,8 +2230,9 @@ void HTreeBuilder::initTopLevelSinks(
  {
    sinkLocations.clear();
    clock_.forEachSink([&](const ClockInst& sink) {
@@ -7352,7 +7258,7 @@ index 19710ceb81..d336bd01f6 100644
      sinkInsts.emplace_back(&sink);
    });
  }
-@@ -1890,8 +2303,10 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
+@@ -1890,8 +2291,10 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
      branchPt2 = Point<double>(means[1].first, means[1].second);
    }
  
@@ -7363,7 +7269,7 @@ index 19710ceb81..d336bd01f6 100644
    unsigned movedSinks = 0;
    const double errorFactor = 1.2;
    for (int clusterIdx = 0; clusterIdx < clusters.size(); ++clusterIdx) {
-@@ -1927,18 +2342,137 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
+@@ -1927,18 +2330,137 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
    }
  }
  
@@ -7505,7 +7411,7 @@ index 19710ceb81..d336bd01f6 100644
  
    if (topBufferName_.empty()) {
      topBufferName_ = rootBuffer.getName();
-@@ -1970,13 +2504,47 @@ void HTreeBuilder::createClockSubNets()
+@@ -1970,13 +2492,47 @@ void HTreeBuilder::createClockSubNets()
      if (topLevelTopology.getBranchSinksLocations(idx).empty()) {
        return;
      }
@@ -7555,7 +7461,7 @@ index 19710ceb81..d336bd01f6 100644
  		 "createClockSubNets level 1 clk_buf_1_{}_ : {} => {}",
  		 std::to_string(idx), branchPoint, legalBranchPoint);
      } else {
-@@ -1996,14 +2564,18 @@ void HTreeBuilder::createClockSubNets()
+@@ -1996,14 +2552,18 @@ void HTreeBuilder::createClockSubNets()
                             rootClockSubNet,
                             *techChar_,
                             wireSegmentUnit_,
@@ -7577,7 +7483,7 @@ index 19710ceb81..d336bd01f6 100644
      }
      if (isFirstPoint) {
        treeBufLevels_ += builder.getNumBufferLevels();
-@@ -2027,8 +2599,48 @@ void HTreeBuilder::createClockSubNets()
+@@ -2027,8 +2587,48 @@ void HTreeBuilder::createClockSubNets()
        LevelTopology& parentTopology = topologyForEachLevel_[levelIdx - 1];
        Point<double> parentPoint = parentTopology.getBranchingPoint(parentIdx);
  
@@ -7627,7 +7533,7 @@ index 19710ceb81..d336bd01f6 100644
        commitMoveLoc(branchPoint, legalBranchPoint);
  
        // clang-format off
-@@ -2056,7 +2668,9 @@ void HTreeBuilder::createClockSubNets()
+@@ -2056,7 +2656,9 @@ void HTreeBuilder::createClockSubNets()
                               *parentTopology.getBranchDrivingSubNet(parentIdx),
                               *techChar_,
                               wireSegmentUnit_,
@@ -7638,7 +7544,7 @@ index 19710ceb81..d336bd01f6 100644
  
        // Set clock tree level the first time only.
        if (builder.getDrivingSubNet()->getTreeLevel() < 0) {
-@@ -2064,12 +2678,14 @@ void HTreeBuilder::createClockSubNets()
+@@ -2064,12 +2666,14 @@ void HTreeBuilder::createClockSubNets()
        }
  
        if (!options_->getTreeBuffer().empty()) {
@@ -7655,7 +7561,7 @@ index 19710ceb81..d336bd01f6 100644
        }
        if (isFirstPoint) {
          treeBufLevels_ += builder.getNumBufferLevels();
-@@ -2081,30 +2697,762 @@ void HTreeBuilder::createClockSubNets()
+@@ -2081,30 +2685,762 @@ void HTreeBuilder::createClockSubNets()
  
    LevelTopology& leafTopology = topologyForEachLevel_.back();
    unsigned numSinks = 0;
@@ -7699,7 +7605,7 @@ index 19710ceb81..d336bd01f6 100644
 +        if (target > 0.0) {
 +          depth = static_cast<int>(std::round(target / tapStageDelay_));
 +          depth = std::max(0, std::min(depth, tapMaxDepth_));
-+        }
+         }
 +        if (isMacroBlockInst(ff->getDbInst())) {
 +          depth = 0;
 +        }
@@ -7730,11 +7636,11 @@ index 19710ceb81..d336bd01f6 100644
 +              break;
 +            }
 +          }
-         }
++        }
 +        if (sinkIt == mapLocationToSink_.end()) {
 +          // Second-level clustering or legalizeOneBuffer can move a centroid
-+          // beyond eps.  Use the nearest map entry: skipping a leaf buffer
-+          // would leave its input pin unconnected.
++          // beyond eps; the nearest map entry is then used, so every leaf
++          // buffer is connected.
 +          double bestDist = std::numeric_limits<double>::max();
 +          auto bestIt = mapLocationToSink_.end();
 +          for (auto it = mapLocationToSink_.begin();
@@ -8083,7 +7989,7 @@ index 19710ceb81..d336bd01f6 100644
 +
 +    // Load-aware depths and stage masters (empty = every stage uses chainMaster).
 +    std::vector<std::string> stageMaster;
-+    if (downstream > 0 && maxDepth > 0 && loadAwareTapsEnabled()) {
++    if (downstream > 0 && maxDepth > 0) {
 +      std::vector<ClockInst*> demoted;
 +      assignLoadAwareTapDepths(dg,
 +                               homeNet,
@@ -8225,8 +8131,8 @@ index 19710ceb81..d336bd01f6 100644
 +        bx = static_cast<int>(legalLoc.getX() * wireSegmentUnit_);
 +        by = static_cast<int>(legalLoc.getY() * wireSegmentUnit_);
 +      }
-+      // Clamp the buffer into the core area: legalizeOneBuffer only avoids
-+      // blockages and resolveLocationCollision jitters +X without a bound check.
++      // The location is clamped to the core area (legalizeOneBuffer and
++      // resolveLocationCollision do not check the core boundary).
 +      if (db_ != nullptr && db_->getChip() != nullptr) {
 +        const odb::Rect core = db_->getChip()->getBlock()->getCoreArea();
 +        odb::dbMaster* cm = db_->findMaster(stageM.c_str());
@@ -8402,7 +8308,7 @@ index 19710ceb81..d336bd01f6 100644
 +      t.net->findIndex(sink);    // throws when the sink was removed
 +      replaced = false;
 +    } catch (const std::out_of_range&) {
-+      // expected on the second lookup
++      // Thrown by the second lookup when the sink was removed.
 +    }
 +    logger_->info(CTS,
 +                  721,
@@ -8434,7 +8340,7 @@ index 19710ceb81..d336bd01f6 100644
  }
  
  void HTreeBuilder::createSingleBufferClockNet()
-@@ -2242,7 +3590,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
+@@ -2242,7 +3578,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
                                 ClockSubNet& drivingSubNet,
                                 const TechChar& techChar,
                                 const unsigned techCharDistUnit,
@@ -8445,7 +8351,7 @@ index 19710ceb81..d336bd01f6 100644
      : instPrefix_(instPrefix),
        netPrefix_(netPrefix),
        root_(root),
-@@ -2252,7 +3602,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
+@@ -2252,7 +3590,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
        techCharDistUnit_(techCharDistUnit),
        clock_(&clock),
        drivingSubNet_(&drivingSubNet),
@@ -8456,7 +8362,7 @@ index 19710ceb81..d336bd01f6 100644
  {
  }
  
-@@ -2286,15 +3638,19 @@ void SegmentBuilder::build(const std::string& forceBuffer)
+@@ -2286,15 +3626,19 @@ void SegmentBuilder::build(const std::string& forceBuffer)
        const std::string buffMaster = !forceBuffer.empty()
                                           ? forceBuffer
                                           : wireSegment.getBufferMaster(buffer);
@@ -8478,7 +8384,7 @@ index 19710ceb81..d336bd01f6 100644
  
        // clang-format off
        if (bufferLoc != legalBufferLoc) {
-@@ -2332,11 +3688,15 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
+@@ -2332,11 +3676,15 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
      return;
    }
  
@@ -8495,18 +8401,17 @@ index 19710ceb81..d336bd01f6 100644
    tree_->addTreeLevelBuffer(&newBuffer);
    // clang-format off
    debugPrint(getTree()->getLogger(), CTS, "legalizer", 2,
-@@ -2349,4 +3709,504 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
+@@ -2349,4 +3697,497 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
    numBufferLevels_++;
  }
  
 +// ---------------------------------------------------------------------------
 +// Load-aware depth assignment for one shared delay chain (CTS_LOAD_AWARE_TAPS=1).
 +//
-+// The constant-delay rule depth = round(a / tapStageDelay_) ignores the load of
-+// the chain stages: a stage carrying many registers is slower than the no-load
-+// stage delay, and the depth-0 reference (the register's own leaf buffer) is a
-+// loaded stage as well.  Deep, heavily tapped stages therefore deliver more than
-+// the LP target.
++// The constant-delay rule depth = round(a / tapStageDelay_) uses one stage
++// delay for every stage.  A stage carrying many registers is slower than the
++// unloaded stage, and the depth-0 reference (the register's own leaf buffer) is
++// a loaded stage as well, so the delay of each stage is computed from its load.
 +//
 +// Model (Liberty NLDM delays and clock-wire capacitance, no STA call):
 +//   stage k = 1..Dmax+1 of the chain (stage 1 = first stage, or the bridge
@@ -8528,9 +8433,9 @@ index 19710ceb81..d336bd01f6 100644
 +// stage behind the first one (behind the bridge for a bridged chain) may use a
 +// wider buffer of the same family (TechChar::bufUpsizeMasters); the smallest
 +// master within 0.25 ps x N of the best total is taken when it gains at least
-+// 0.5 ps x N.  The stage that loads the branch net is never resized: its input
-+// cap would slow every register of the branch, which this chain-local model does
-+// not see.  Depth 0 is allowed only if the register's leaf net still has a sink.
++// 0.5 ps x N.  The stage that loads the branch net is not resized (its input cap
++// is a load of the branch net).  Depth 0 is allowed only if the register's leaf
++// net still has a sink.
 +// ---------------------------------------------------------------------------
 +int HTreeBuilder::assignLoadAwareTapDepths(
 +    std::map<int, std::vector<ClockInst*>>& dg,
@@ -8914,7 +8819,7 @@ index 19710ceb81..d336bd01f6 100644
 +  std::map<int, std::vector<ClockInst*>> ndg;
 +  for (auto& [d, v] : dg) {
 +    if (d <= 0) {
-+      ndg[d] = v;  // nothing at depth 0 is ever in a chain group; kept as-is
++      ndg[d] = v;  // depth <= 0: not in a chain, copied unchanged
 +    }
 +  }
 +  for (const F& f : fs) {
@@ -8962,12 +8867,6 @@ index 19710ceb81..d336bd01f6 100644
 +// also depend on the LP targets, which are fixed for the session).
 +void HTreeBuilder::loadHoldBudgets()
 +{
-+  if (!loadAwareTapsEnabled()) {
-+    logger_->info(CTS,
-+                  2071,
-+                  "Hold budgets not loaded (load-aware taps off)");
-+    return;
-+  }
 +  const char* csv = std::getenv("CTS_TIMING_GRAPH_CSV");
 +  const char* ioCsv = std::getenv("CTS_IO_TIMING_CSV");
 +  auto stamp = [](const char* f) {
@@ -9136,7 +9035,7 @@ index 6b3c2ec9a2..ae70c33a4a 100644
  
  }  // namespace cts
 diff --git a/src/cts/src/LatencyBalancer.cpp b/src/cts/src/LatencyBalancer.cpp
-index b0242a8793..dd1bca5d53 100644
+index b0242a8793..eee90ac390 100644
 --- a/src/cts/src/LatencyBalancer.cpp
 +++ b/src/cts/src/LatencyBalancer.cpp
 @@ -3,8 +3,11 @@
@@ -9160,26 +9059,23 @@ index b0242a8793..dd1bca5d53 100644
  using utl::CTS;
  
  int LatencyBalancer::run()
-@@ -48,11 +53,61 @@ int LatencyBalancer::run()
+@@ -48,11 +53,58 @@ int LatencyBalancer::run()
                  33,
                  "Balancing latency for clock {}",
                  root_->getClock().getSdcName());
-+  // CTS_BALANCER_BASE_RESTORE=1: pad every base sink to its own Phase-1
-+  // balanced latency (RESULTS_DIR/cts_base_latency.csv) and leave the shared
-+  // delay chains untouched, so the tree reproduces the base latency the LP
-+  // schedule assumed.  Otherwise the uniform worseDelay_, inflated by the
-+  // chains, pads undelivered sinks above their base latency.
++  // CTS_BALANCER_BASE_RESTORE=1: pad every base sink to its own balanced
++  // latency in the initial tree (RESULTS_DIR/cts_base_latency.csv) and leave
++  // the shared delay chains untouched, so the tree reproduces the base latency
++  // the LP schedule assumes.  Otherwise all sinks are padded to the uniform
++  // worseDelay_, which includes the delay-chain arrivals.
 +  {
 +    const char* b = std::getenv("CTS_BALANCER_BASE_RESTORE");
 +    baseRestore_ = (b && std::atoi(b) != 0);
 +    if (baseRestore_) {
-+      // CTS_BASE_LATENCY_CSV overrides the default
-+      // $RESULTS_DIR/cts_base_latency.csv.
-+      const char* bp = std::getenv("CTS_BASE_LATENCY_CSV");
++      // Base latencies (ps): $RESULTS_DIR/cts_base_latency.csv
 +      const char* rd = std::getenv("RESULTS_DIR");
-+      std::string path = (bp && *bp) ? std::string(bp)
-+                                     : std::string(rd && *rd ? rd : ".")
-+                                           + "/cts_base_latency.csv";
++      const std::string path
++          = std::string(rd && *rd ? rd : ".") + "/cts_base_latency.csv";
 +      std::ifstream in(path);
 +      std::string line;
 +      if (in.is_open()) {
@@ -9222,7 +9118,7 @@ index b0242a8793..dd1bca5d53 100644
    logger_->info(CTS,
                  36,
                  " inserted {} delay buffers",
-@@ -126,6 +181,19 @@ void LatencyBalancer::findLeafBuilders(TreeBuilder* builder)
+@@ -126,6 +178,19 @@ void LatencyBalancer::findLeafBuilders(TreeBuilder* builder)
  
  void LatencyBalancer::buildGraph(odb::dbNet* clkInputNet)
  {
@@ -9242,7 +9138,7 @@ index b0242a8793..dd1bca5d53 100644
    std::string rootSrcName;
    odb::dbITerm* rootOutputITerm = clkInputNet->getFirstOutput();
    if (!rootOutputITerm) {
-@@ -166,15 +234,64 @@ void LatencyBalancer::buildGraph(odb::dbNet* clkInputNet)
+@@ -166,15 +231,63 @@ void LatencyBalancer::buildGraph(odb::dbNet* clkInputNet)
          odb::dbInst* sinkInst = sinkIterm->getInst();
          std::string sinkName = sinkInst->getName();
          GraphNode sinkNode = GraphNode(sinkId, sinkName, sinkIterm);
@@ -9257,9 +9153,8 @@ index b0242a8793..dd1bca5d53 100644
  
 +        // CTS_BALANCER_FULL_TRAVERSE=1: traverse into leaf builders (balance
 +        // every branch inside the sub-tree) instead of black-boxing the whole
-+        // sub-tree with its average sink arrival.  The average hides the depth
-+        // spread inside a gated-clock register tree, so the balancer would have
-+        // no sibling nodes to equalize.
++        // sub-tree with its average sink arrival.  The average does not
++        // represent the depth spread inside a gated-clock register tree.
          if (inst2builder_.find(sinkName) != inst2builder_.end()) {
 -          auto builder = inst2builder_[sinkName];
 -          float builerAvgArrival = computeAveSinkArrivals(builder);
@@ -9278,7 +9173,7 @@ index b0242a8793..dd1bca5d53 100644
 +              worseDelay_ = std::max(worseDelay_, builerAvgArrival);
 +            }
 +            graph_[sinkId].arrival = builerAvgArrival;
-+            // Base restore: the mean Phase-1 latency over the builder's sinks
++            // Base restore: the mean base latency over the builder's sinks
 +            // outside the delay chains is the target of this black box.
 +            if (baseRestore_) {
 +              double sum = 0.0;
@@ -9312,7 +9207,7 @@ index b0242a8793..dd1bca5d53 100644
          }
  
          if (isSink(sinkIterm)) {
-@@ -201,8 +318,21 @@ void LatencyBalancer::buildGraph(odb::dbNet* clkInputNet)
+@@ -201,8 +314,21 @@ void LatencyBalancer::buildGraph(odb::dbNet* clkInputNet)
                  }
                }
              }
@@ -9321,7 +9216,7 @@ index b0242a8793..dd1bca5d53 100644
 +              worseDelay_ = std::max(worseDelay_, (arrival + insDelay));
 +            }
              graph_[sinkId].arrival = arrival + insDelay;
-+            // Base restore: this register's Phase-1 balanced latency.
++            // Base restore: this register's base latency.
 +            if (baseRestore_ && !graph_[sinkId].isDelivery) {
 +              auto bit = baseLatency_.find(sinkInst->getName());
 +              if (bit != baseLatency_.end()) {
@@ -9335,7 +9230,7 @@ index b0242a8793..dd1bca5d53 100644
              debugPrint(logger_,
                         CTS,
                         "insertion delay",
-@@ -310,6 +440,18 @@ float LatencyBalancer::computeAveSinkArrivals(TreeBuilder* builder)
+@@ -310,6 +436,18 @@ float LatencyBalancer::computeAveSinkArrivals(TreeBuilder* builder)
    return aveArrival;
  }
  
@@ -9354,7 +9249,7 @@ index b0242a8793..dd1bca5d53 100644
  void LatencyBalancer::computeSinkArrivalRecur(odb::dbNet* topClokcNet,
                                                odb::dbITerm* iterm,
                                                float& sumArrivals,
-@@ -318,6 +460,16 @@ void LatencyBalancer::computeSinkArrivalRecur(odb::dbNet* topClokcNet,
+@@ -318,6 +456,16 @@ void LatencyBalancer::computeSinkArrivalRecur(odb::dbNet* topClokcNet,
    if (iterm) {
      odb::dbInst* inst = iterm->getInst();
      if (inst) {
@@ -9371,7 +9266,7 @@ index b0242a8793..dd1bca5d53 100644
        if (isSink(iterm)) {
          // either register or macro input pin
          sta::Pin* pin = network_->dbToSta(iterm);
-@@ -374,8 +526,19 @@ void LatencyBalancer::computeNumberOfDelayBuffers(int nodeId,
+@@ -374,8 +522,19 @@ void LatencyBalancer::computeNumberOfDelayBuffers(int nodeId,
                                                    int srcY)
  {
    GraphNode* node = &graph_[nodeId];
@@ -9392,7 +9287,7 @@ index b0242a8793..dd1bca5d53 100644
  
      // adjust buffer delay for wire cap
      int sinkX, sinkY;
-@@ -384,7 +547,10 @@ void LatencyBalancer::computeNumberOfDelayBuffers(int nodeId,
+@@ -384,7 +543,10 @@ void LatencyBalancer::computeNumberOfDelayBuffers(int nodeId,
      float offsetY = (float) (sinkY - srcY) / (numBuffers + 1);
      auto newDelay = computeBufferDelay((std::abs(offsetX) + std::abs(offsetY))
                                         * capPerDBU_);
@@ -9404,7 +9299,7 @@ index b0242a8793..dd1bca5d53 100644
      if (node->childrenIds.empty()) {
        debugPrint(logger_,
                   CTS,
-@@ -424,13 +590,59 @@ void LatencyBalancer::balanceLatencies(int nodeId)
+@@ -424,13 +586,59 @@ void LatencyBalancer::balanceLatencies(int nodeId)
  
    double maxArrival = std::numeric_limits<double>::min();
    std::map<int, std::vector<odb::dbITerm*>> buffersNeeded2Childern;
@@ -9457,7 +9352,7 @@ index b0242a8793..dd1bca5d53 100644
 +    }
 +  }
 +  if (!anyBaseChild && !node->childrenIds.empty()) {
-+    // only delivery children below: treat this node as delivery as well
++    // Only delay-chain children: the node is treated as delay chain as well.
 +    node->isDelivery = true;
 +    maxArrival = 0.0;
 +  }
@@ -9465,7 +9360,7 @@ index b0242a8793..dd1bca5d53 100644
    // If the children need a different amount of buffers insert this difference
    for (auto& [bufToInsert, children] :
 diff --git a/src/cts/src/LatencyBalancer.h b/src/cts/src/LatencyBalancer.h
-index ba121f0f42..c3d6887bfe 100644
+index ba121f0f42..79f045e3d7 100644
 --- a/src/cts/src/LatencyBalancer.h
 +++ b/src/cts/src/LatencyBalancer.h
 @@ -7,6 +7,7 @@
@@ -9486,9 +9381,9 @@ index ba121f0f42..c3d6887bfe 100644
 +  // define the arrival of the parent.
 +  bool isDelivery = false;
 +  // Absolute latency target in seconds (CTS_BALANCER_BASE_RESTORE): the
-+  // Phase-1 balanced latency of this sink, or the mean over a black-boxed
-+  // sub-tree, i.e. the base latency the LP schedule assumed.  Replaces
-+  // worseDelay_ as the target of this node.
++  // balanced latency of this sink in the initial tree, or the mean over a
++  // black-boxed sub-tree, i.e. the base latency the LP schedule assumes.
++  // Used instead of worseDelay_ as the target of this node.
 +  bool hasAbsTarget = false;
 +  double absTarget = 0.0;
  };
@@ -9498,7 +9393,7 @@ index ba121f0f42..c3d6887bfe 100644
    int delayBufIndex_{0};
    std::vector<GraphNode> graph_;
    std::map<std::string, TreeBuilder*> inst2builder_;
-+  // CTS_BALANCER_BASE_RESTORE: Phase-1 balanced latency per register (s).
++  // CTS_BALANCER_BASE_RESTORE: initial-tree balanced latency per register (s).
 +  std::unordered_map<std::string, double> baseLatency_;
 +  bool baseRestore_ = false;
 +  int baseHit_ = 0, baseMiss_ = 0;
@@ -9509,10 +9404,10 @@ index ba121f0f42..c3d6887bfe 100644
  }  // namespace cts
 diff --git a/src/cts/src/SelEval.h b/src/cts/src/SelEval.h
 new file mode 100644
-index 0000000000..8dc05fca11
+index 0000000000..d9eba4fd27
 --- /dev/null
 +++ b/src/cts/src/SelEval.h
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,452 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -9604,6 +9499,9 @@ index 0000000000..8dc05fca11
 +      : sta_(sta), network_(network), est_(est), logger_(logger)
 +  {
 +    block_ = db->getChip()->getBlock();
++    if (prefix.empty()) {  // no per-evaluation log (stage Q)
++      return;
++    }
 +    evalCsv_.open(resultsDir + "/" + prefix + "_evals.csv");
 +    evalCsv_ << "eval,label,rc_mode,touched_nets,slew_dirty_nets,limit_nets,"
 +                "rc_s,sta_first_query_s,requireds_once_s,tns_wns_rest_s,"
@@ -10131,7 +10029,7 @@ index 0000000000..f3ade16958
 +}
 +}
 diff --git a/src/cts/src/TechChar.cpp b/src/cts/src/TechChar.cpp
-index 016393be69..0bf3cbeb6b 100644
+index 016393be69..70f31729d9 100644
 --- a/src/cts/src/TechChar.cpp
 +++ b/src/cts/src/TechChar.cpp
 @@ -3,8 +3,12 @@
@@ -10180,14 +10078,14 @@ index 016393be69..0bf3cbeb6b 100644
 +            auto* model = dynamic_cast<sta::GateTimingModel*>(arc->model());
 +            if (!model) continue;
 +            sta::ArcDelay ad; sta::Slew sl;
-+            // Two-pass slew convergence: first with slew=0, then with output slew
++            // Two passes: input slew 0, then the output slew of the first pass.
 +            model->gateDelay(pvt, 0.0, charBufInputCap_, false, ad, sl);
 +            model->gateDelay(pvt, sl, charBufInputCap_, false, ad, sl);
 +            double d = static_cast<double>(ad);
 +            if (d > maxDelay) maxDelay = d;
 +          }
 +        }
-+        charBufDelay_ns_ = maxDelay * 1e9;  // seconds -> nanoseconds
++        charBufDelay_ns_ = maxDelay * 1e9;  // seconds to nanoseconds
 +        logger_->info(CTS, 833,
 +            "Liberty charBuf delay: {:.4f}ns at input_cap={:.4f}fF ({})",
 +            charBufDelay_ns_, charBufInputCap_ * 1e15, bufMasterName);
@@ -10198,7 +10096,7 @@ index 016393be69..0bf3cbeb6b 100644
    odb::dbMaster* sinkMaster
        = db_->findMaster(options_->getSinkBuffer().c_str());
  
-@@ -1821,4 +1862,155 @@ bool TechChar::isTopologyMonotonic(const std::vector<size_t>& row)
+@@ -1821,4 +1862,152 @@ bool TechChar::isTopologyMonotonic(const std::vector<size_t>& row)
    return monotonic;
  }
  
@@ -10307,10 +10205,7 @@ index 016393be69..0bf3cbeb6b 100644
 +  };
 +  std::vector<std::string> dontUse;
 +  {
-+    const char* e = std::getenv("CTS_REFINE_DONT_USE");
-+    if (e == nullptr) {
-+      e = std::getenv("DONT_USE_CELLS");
-+    }
++    const char* e = std::getenv("DONT_USE_CELLS");
 +    std::istringstream du(e != nullptr ? e : "");
 +    std::string tok;
 +    while (du >> tok) {
@@ -10400,10 +10295,10 @@ index c5594391e4..70e10a11c0 100644
    std::vector<std::string> masterNames_;
 diff --git a/src/cts/src/TimingGraphExtractor.cpp b/src/cts/src/TimingGraphExtractor.cpp
 new file mode 100644
-index 0000000000..6e67de12f9
+index 0000000000..b7353993f3
 --- /dev/null
 +++ b/src/cts/src/TimingGraphExtractor.cpp
-@@ -0,0 +1,1601 @@
+@@ -0,0 +1,1505 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2019-2025, The OpenROAD Authors
 +
@@ -10520,19 +10415,12 @@ index 0000000000..6e67de12f9
 +  return "";
 +}
 +
-+// "1" enables a boolean extraction option.
-+bool envFlag(const char* name)
-+{
-+  const char* v = std::getenv(name);
-+  return v && std::string(v) == "1";
-+}
-+
 +// ----------------------------------------------------------------------------
 +// Launch partitioning, EXTRACT_PARTITION="k/N" (active for N > 1 only).
 +// Each of N processes handles the launch registers of its partition; the merge
 +// step reassembles the single-process outputs from the
 +// per-launch index files.  Membership depends only on the rank of the register
-+// name in byte-wise sorted order, N and EXTRACT_PARTITION_P0_WEIGHT, so every
++// name in byte-wise sorted order and N, so every
 +// process of a run computes the same disjoint cover.
 +// ----------------------------------------------------------------------------
 +struct LaunchPartition
@@ -10565,11 +10453,11 @@ index 0000000000..6e67de12f9
 +// Registers that have an STA instance, numbered in odb_registers_ iteration
 +// order (the single-process order); returns the members of `part` sorted by
 +// name.  *n_total receives the size of the whole launch universe.
-+// EXTRACT_PARTITION_P0_WEIGHT=w (integer percent, 0..99) gives partition 0,
-+// which also runs the input-port side of the IO pass, w/100 of the launches of
-+// every other partition (w=0: input ports only).  The partition-0 launches are
-+// spread evenly over the name order (step w / M, M = 100 (N - 1) + w); the
-+// remaining ranks go round-robin to 1..N-1.  Unset or invalid: rank % N.
++// Partition 0, which also runs the input-port side of the IO pass, gets
++// kPartition0Weight percent of the launches of every other partition.  The
++// partition-0 launches are spread evenly over the name order (step w / M,
++// M = 100 (N - 1) + w); the remaining ranks go round-robin to 1..N-1.  With
++// N = 1 the single partition holds every launch.
 +std::vector<LaunchMember> partitionMembers(
 +    const std::unordered_map<std::string, odb::dbInst*>& regs,
 +    sta::dbNetwork* network,
@@ -10593,34 +10481,22 @@ index 0000000000..6e67de12f9
 +            [](const LaunchMember& a, const LaunchMember& b) {
 +              return a.name < b.name;
 +            });
++  if (part.total <= 1) {
++    return all;
++  }
++  constexpr int kPartition0Weight = 50;
 +  std::vector<LaunchMember> members;
-+  int p0_weight = -1;
-+  if (const char* s = std::getenv("EXTRACT_PARTITION_P0_WEIGHT")) {
-+    char* end = nullptr;
-+    const long v = std::strtol(s, &end, 10);
-+    if (end != s && *end == '\0' && v >= 0 && v <= 99) {
-+      p0_weight = static_cast<int>(v);
-+    }
-+  }
-+  if (p0_weight >= 0 && part.total > 1) {
-+    const unsigned long long w = static_cast<unsigned long long>(p0_weight);
-+    const unsigned long long m = 100ULL * (part.total - 1) + w;
-+    for (size_t rank = 0; rank < all.size(); ++rank) {
-+      // Number of partition-0 launches among ranks [0, rank) and [0, rank].
-+      const unsigned long long before = rank * w / m;
-+      const unsigned long long after = (rank + 1) * w / m;
-+      const int owner
-+          = (after > before)
-+                ? 0
-+                : 1 + static_cast<int>((rank - before) % (part.total - 1));
-+      if (owner == part.id) {
-+        members.push_back(std::move(all[rank]));
-+      }
-+    }
-+    return members;
-+  }
++  const unsigned long long w = static_cast<unsigned long long>(kPartition0Weight);
++  const unsigned long long m = 100ULL * (part.total - 1) + w;
 +  for (size_t rank = 0; rank < all.size(); ++rank) {
-+    if (static_cast<int>(rank % part.total) == part.id) {
++    // Number of partition-0 launches among ranks [0, rank) and [0, rank].
++    const unsigned long long before = rank * w / m;
++    const unsigned long long after = (rank + 1) * w / m;
++    const int owner
++        = (after > before)
++              ? 0
++              : 1 + static_cast<int>((rank - before) % (part.total - 1));
++    if (owner == part.id) {
 +      members.push_back(std::move(all[rank]));
 +    }
 +  }
@@ -10629,7 +10505,7 @@ index 0000000000..6e67de12f9
 +
 +// Plain-value image of one register -> output-port PathEnd.  PathEnds are
 +// owned by the search's path groups and die at the next findPathEnds, so the
-+// register pass keeps these records for the IO pass (EXTRACT_REUSE_FF_PO=1).
++// register pass keeps these records for the IO pass.
 +struct PoEndRecord
 +{
 +  std::string why;       // admissionReason(); empty = admitted
@@ -10753,12 +10629,11 @@ index 0000000000..6e67de12f9
 +// IO edges.  Input ports: one query per port (setup, hold, removal, recovery);
 +// output ports: one query per launch register to all output ports (setup,
 +// hold).  The endpoint bound is the whole pin universe, so no end is
-+// truncated; reaching the bound is an error.
-+//   EXTRACT_FUSE_MINMAX=1 : one query with all check roles instead of
-+//                           separate min/max (and async) queries; the ends are
-+//                           split by path group and consumed in the same order.
-+//   EXTRACT_REUSE_FF_PO=1 : replay the register -> output-port ends stashed
-+//                           by extractRegisterEdges instead of re-querying.
++// truncated; reaching the bound is an error.  Input ports: one query with all
++// check roles; the ends are split by path group and consumed in the order
++// setup, hold, removal, recovery.  Output ports: the register -> output-port
++// ends stashed by extractRegisterEdges are replayed (re-queried when the stash
++// is not valid for this block and timing state).
 +std::vector<IOEdge> TimingGraphExtractor::extractIOEdges()
 +{
 +  std::vector<IOEdge> result;
@@ -10784,8 +10659,6 @@ index 0000000000..6e67de12f9
 +  std::ofstream audit(base + "/io_admission_events.csv");
 +  audit << "status,reason,endpoint\n";
 +  size_t unsupported = 0, retained = 0;
-+  const bool fuse = envFlag("EXTRACT_FUSE_MINMAX");
-+  const bool reuse = envFlag("EXTRACT_REUSE_FF_PO");
 +  // Partition bookkeeping for the merge step (inactive unless N > 1).
 +  const LaunchPartition part = launchPartition();
 +  const bool parted = part.total > 1;
@@ -10983,44 +10856,28 @@ index 0000000000..6e67de12f9
 +      continue;
 +    }
 +
-+    if (!fuse) {
-+      // setup (max), hold (min), removal (min), recovery (max); each result is
-+      // consumed before the next query invalidates its PathEnds.
-+      piApply(port_name,
-+              piQuery(port_pin, sta::MinMaxAll::max(), true, false, false, false),
-+              0);
-+      piApply(port_name,
-+              piQuery(port_pin, sta::MinMaxAll::min(), false, true, false, false),
-+              1);
-+      piApply(port_name,
-+              piQuery(port_pin, sta::MinMaxAll::min(), false, false, false, true),
-+              2);
-+      piApply(port_name,
-+              piQuery(port_pin, sta::MinMaxAll::max(), false, false, true, false),
-+              3);
-+    } else {
-+      // Fused query: PathGroups builds the max groups from (setup, recovery)
-+      // and the min groups from (hold, removal), so one call with all four
-+      // flags returns the union of the four separate calls (clock/named groups
-+      // <- setup|hold, "asynchronous" group <- recovery|removal); the group
-+      // path count is a per-group bound.  Split by group, then emit in the
-+      // separate-query order.
-+      sta::PathEndSeq all_ends = piQuery(
-+          port_pin, sta::MinMaxAll::all(), true, true, true, true);
-+      sta::PathEndSeq split[4];
-+      for (sta::PathEnd* pe : all_ends) {
-+        const bool is_min = pe && pe->minMax(sta_) == sta::MinMax::min();
-+        const bool is_async
-+            = pe && pe->pathGroup()
-+              && std::strcmp(pe->pathGroup()->name(),
-+                             sta::PathGroups::asyncPathGroupName())
-+                     == 0;
-+        split[is_min ? (is_async ? 2 : 1) : (is_async ? 3 : 0)].push_back(pe);
-+      }
-+      for (int kind = 0; kind < 4; ++kind) {
-+        piApply(port_name, split[kind], kind);
-+      }
++    // Fused query: PathGroups builds the max groups from (setup, recovery)
++    // and the min groups from (hold, removal), so one call with all four
++    // flags returns the union of the four separate calls (clock/named groups
++    // <- setup|hold, "asynchronous" group <- recovery|removal); the group
++    // path count is a per-group bound.  Split by group, then emit in the
++    // separate-query order.
++    sta::PathEndSeq all_ends = piQuery(
++        port_pin, sta::MinMaxAll::all(), true, true, true, true);
++    sta::PathEndSeq split[4];
++    for (sta::PathEnd* pe : all_ends) {
++      const bool is_min = pe && pe->minMax(sta_) == sta::MinMax::min();
++      const bool is_async
++          = pe && pe->pathGroup()
++            && std::strcmp(pe->pathGroup()->name(),
++                           sta::PathGroups::asyncPathGroupName())
++                   == 0;
++      split[is_min ? (is_async ? 2 : 1) : (is_async ? 3 : 0)].push_back(pe);
 +    }
++    for (int kind = 0; kind < 4; ++kind) {
++      piApply(port_name, split[kind], kind);
++    }
++
 +  }
 +
 +  if (parted) {
@@ -11030,7 +10887,7 @@ index 0000000000..6e67de12f9
 +
 +  // ==================== register -> output port ====================
 +  // Row emission from a plain-value record, shared by the query path and the
-+  // EXTRACT_REUSE_FF_PO replay path.
++  // replay path.
 +  auto poConsume = [&](const PoEndRecord& r, bool is_setup) {
 +    if (!r.why.empty()) {
 +      ++unsupported;
@@ -11135,7 +10992,7 @@ index 0000000000..6e67de12f9
 +  // Registers without a stash entry (another partition) are re-queried.
 +  PoCache& po_cache = poCache();
 +  bool use_stash = false;
-+  if (reuse && !output_ports.empty()) {
++  if (!output_ports.empty()) {
 +    if (po_cache.valid && po_cache.block == block_ && !odb_registers_.empty()) {
 +      float fp[4];
 +      timingFingerprint(sta_, fp);
@@ -11143,7 +11000,7 @@ index 0000000000..6e67de12f9
 +    }
 +    if (!use_stash) {
 +      logger_->report(
-+          "EXTRACT_REUSE_FF_PO: no valid register-pass stash; re-querying "
++          "IO extraction: no valid register-pass stash; re-querying "
 +          "register -> output port per register");
 +    }
 +  }
@@ -11180,25 +11037,20 @@ index 0000000000..6e67de12f9
 +      }
 +    }
 +
-+    if (!fuse) {
-+      // setup (max) then hold (min), each consumed before the next query.
-+      poApply(poQuery(source_inst, sta::MinMaxAll::max(), true, false), true);
-+      poApply(poQuery(source_inst, sta::MinMaxAll::min(), false, true), false);
-+    } else {
-+      // Fused: max groups <- setup, min groups <- hold; split by min/max.
-+      sta::PathEndSeq all_ends
-+          = poQuery(source_inst, sta::MinMaxAll::all(), true, true);
-+      sta::PathEndSeq max_ends, min_ends;
-+      for (sta::PathEnd* pe : all_ends) {
-+        if (pe && pe->minMax(sta_) == sta::MinMax::min()) {
-+          min_ends.push_back(pe);
-+        } else {
-+          max_ends.push_back(pe);
-+        }
++    // Fused: max groups <- setup, min groups <- hold; split by min/max.
++    sta::PathEndSeq all_ends
++        = poQuery(source_inst, sta::MinMaxAll::all(), true, true);
++    sta::PathEndSeq max_ends, min_ends;
++    for (sta::PathEnd* pe : all_ends) {
++      if (pe && pe->minMax(sta_) == sta::MinMax::min()) {
++        min_ends.push_back(pe);
++      } else {
++        max_ends.push_back(pe);
 +      }
-+      poApply(max_ends, true);
-+      poApply(min_ends, false);
 +    }
++    poApply(max_ends, true);
++    poApply(min_ends, false);
++
 +  };
 +  for (const auto& source : po_sources) {
 +    poOne(source.inst);
@@ -11427,11 +11279,9 @@ index 0000000000..6e67de12f9
 +// launch -> capture with the worst setup / hold path.  An identity row per
 +// launch keeps registers without register -> register paths in the LP
 +// universe (no constraint, no fabricated zero slack).
-+//   EXTRACT_FUSE_MINMAX=1 : one query with MinMaxAll::all() and all check
-+//                           roles per launch; ends split by min/max and
-+//                           consumed setup first, then hold.
-+//   EXTRACT_REUSE_FF_PO=1 : stash the register -> output-port ends for the IO
-+//                           pass.
++// One query per launch with MinMaxAll::all() and all check roles; the ends
++// are split by min/max and consumed setup first, then hold.  The register ->
++// output-port ends are stashed for the IO pass.
 +//   EXTRACT_PARTITION=k/N : this process handles partition k of N launches.
 +std::vector<FFEdge> TimingGraphExtractor::extractRegisterEdges()
 +{
@@ -11469,8 +11319,6 @@ index 0000000000..6e67de12f9
 +  std::unordered_map<const sta::Instance*, bool> latch_cache;
 +  size_t unsupported = 0, retained = 0, empty_queries = 0;
 +
-+  const bool fuse = envFlag("EXTRACT_FUSE_MINMAX");
-+  const bool reuse = envFlag("EXTRACT_REUSE_FF_PO");
 +  const auto t_begin = std::chrono::steady_clock::now();
 +  // Register -> output-port ends seen by this pass are stashed per launch for
 +  // the IO pass.  An older stash is dropped first.
@@ -11479,22 +11327,21 @@ index 0000000000..6e67de12f9
 +  std::unordered_set<const sta::Pin*> po_pins;  // == IO-pass -to pin set
 +  std::unordered_map<odb::dbInst*, std::string> inst_to_name;
 +  PoStash* cur_stash = nullptr;  // stash of the current launch
-+  if (reuse) {
-+    for (auto* bterm : block_->getBTerms()) {
-+      if (bterm->getSigType() == odb::dbSigType::CLOCK) {
-+        continue;
-+      }
-+      if (bterm->getIoType() != odb::dbIoType::OUTPUT) {
-+        continue;
-+      }
-+      if (const sta::Pin* pin = network_->dbToSta(bterm)) {
-+        po_pins.insert(pin);
-+      }
++  for (auto* bterm : block_->getBTerms()) {
++    if (bterm->getSigType() == odb::dbSigType::CLOCK) {
++      continue;
 +    }
-+    for (const auto& [name, inst] : odb_registers_) {
-+      inst_to_name[inst] = name;
++    if (bterm->getIoType() != odb::dbIoType::OUTPUT) {
++      continue;
++    }
++    if (const sta::Pin* pin = network_->dbToSta(bterm)) {
++      po_pins.insert(pin);
 +    }
 +  }
++  for (const auto& [name, inst] : odb_registers_) {
++    inst_to_name[inst] = name;
++  }
++
 +  std::unordered_set<odb::dbInst*> register_set;
 +  for (const auto& [name, inst] : odb_registers_) {
 +    register_set.insert(inst);
@@ -11650,7 +11497,7 @@ index 0000000000..6e67de12f9
 +      }
 +
 +      // Copy what the IO pass needs from an end at an output port; the end
-+      // itself is handled below as before.
++      // itself is processed below like any other end.
 +      if (cur_stash && po_pins.count(end_pin)) {
 +        (is_setup ? cur_stash->setup : cur_stash->hold)
 +            .push_back(makePoEndRecord(
@@ -11794,21 +11641,13 @@ index 0000000000..6e67de12f9
 +  auto consumeEnds = [&](int idx,
 +                         const sta::PathEndSeq& path_ends,
 +                         const std::unordered_set<odb::dbInst*>& launch_set,
-+                         bool is_setup,
-+                         bool fused) {
++                         bool is_setup) {
 +    int n_results = static_cast<int>(path_ends.size());
 +    if (n_results >= n_path_limit) {
-+      if (fused) {
-+        logger_->error(utl::CTS,
-+                       2020,
-+                       "Timing graph: native extraction saturated the "
-+                       "endpoint bound");
-+      } else {
-+        logger_->error(utl::CTS,
-+                       970,
-+                       "Timing graph: native extraction saturated the "
-+                       "endpoint bound");
-+      }
++      logger_->error(utl::CTS,
++                     2020,
++                     "Timing graph: native extraction saturated the "
++                     "endpoint bound");
 +    }
 +    if (n_results == 0) {
 +      ++empty_queries;
@@ -11816,39 +11655,6 @@ index 0000000000..6e67de12f9
 +                << sources[idx].name << ",," << is_setup << ",\n";
 +    }
 +    processPathEnds(path_ends, launch_set, is_setup);
-+  };
-+
-+  // Separate setup (max) or hold (min) query of one launch.
-+  auto singleExtract = [&](int idx, bool is_setup) {
-+    sta::InstanceSet* from_insts = new sta::InstanceSet(network_);
-+    std::unordered_set<odb::dbInst*> launch_set;
-+    from_insts->insert(sources[idx].sta_inst);
-+    launch_set.insert(sources[idx].odb_inst);
-+    sta::ExceptionFrom* from = sta_->makeExceptionFrom(
-+        nullptr, nullptr, from_insts, sta::RiseFallBoth::riseFall());
-+    sta::PathEndSeq path_ends = sta_->findPathEnds(
-+        from,
-+        nullptr,
-+        nullptr,
-+        false,
-+        nullptr,
-+        is_setup ? sta::MinMaxAll::max() : sta::MinMaxAll::min(),
-+        n_path_limit,
-+        1,
-+        true,
-+        false,
-+        -sta::INF,
-+        sta::INF,
-+        false,
-+        nullptr,
-+        is_setup,
-+        !is_setup,
-+        is_setup,
-+        !is_setup,
-+        is_setup,
-+        !is_setup);
-+    ++total_sta_calls;
-+    consumeEnds(idx, path_ends, launch_set, is_setup, false);
 +  };
 +
 +  // Fused query of one launch.  PathGroups builds its max groups from (setup,
@@ -11893,8 +11699,8 @@ index 0000000000..6e67de12f9
 +        max_ends.push_back(pe);
 +      }
 +    }
-+    consumeEnds(idx, max_ends, launch_set, true, true);
-+    consumeEnds(idx, min_ends, launch_set, false, true);
++    consumeEnds(idx, max_ends, launch_set, true);
++    consumeEnds(idx, min_ends, launch_set, false);
 +  };
 +
 +  const int n_sources = static_cast<int>(sources.size());
@@ -11903,15 +11709,9 @@ index 0000000000..6e67de12f9
 +  const auto t_loop = std::chrono::steady_clock::now();
 +
 +  for (int idx = 0; idx < n_sources; ++idx) {
-+    if (reuse) {
-+      cur_stash = &po_cache.by_reg[sources[idx].odb_inst];
-+    }
-+    if (fuse) {
-+      fusedExtract(idx);
-+    } else {
-+      singleExtract(idx, true);   // setup
-+      singleExtract(idx, false);  // hold
-+    }
++    cur_stash = &po_cache.by_reg[sources[idx].odb_inst];
++
++    fusedExtract(idx);
 +    cur_stash = nullptr;
 +    if (part.total > 1) {
 +      part_edge_end.push_back(edges.size());
@@ -11996,11 +11796,10 @@ index 0000000000..6e67de12f9
 +    }
 +  }
 +  // Publish the register -> output-port stash for the IO pass.
-+  if (reuse) {
-+    po_cache.block = block_;
-+    timingFingerprint(sta_, po_cache.fingerprint);
-+    po_cache.valid = true;
-+  }
++  po_cache.block = block_;
++  timingFingerprint(sta_, po_cache.fingerprint);
++  po_cache.valid = true;
++
 +  return edges;
 +}
 +
@@ -12164,7 +11963,7 @@ index 1c471a32d0..50a3107764 100644
    std::vector<TreeBuilder*> children_;
    // Tree buffer levels. Number of buffers inserted in first leg of the HTree
 diff --git a/src/cts/src/TritonCTS.cpp b/src/cts/src/TritonCTS.cpp
-index 42edd07a04..125857242f 100644
+index 42edd07a04..092cdc3e90 100644
 --- a/src/cts/src/TritonCTS.cpp
 +++ b/src/cts/src/TritonCTS.cpp
 @@ -21,16 +21,22 @@
@@ -12190,7 +11989,7 @@ index 42edd07a04..125857242f 100644
  #include "TreeBuilder.h"
  #include "db_sta/dbNetwork.hh"
  #include "db_sta/dbSta.hh"
-@@ -57,9 +63,50 @@
+@@ -57,9 +63,57 @@
  #include "utl/Logger.h"
  
  namespace cts {
@@ -12205,6 +12004,13 @@ index 42edd07a04..125857242f 100644
 +                        sta::dbNetwork*,
 +                        est::EstimateParasitics*,
 +                        utl::Logger*);
++std::string relocEvalMetrics(odb::dbDatabase*,
++                             sta::dbSta*,
++                             sta::dbNetwork*,
++                             est::EstimateParasitics*,
++                             utl::Logger*,
++                             const std::string&,
++                             int);
  
  using utl::CTS;
  
@@ -12241,13 +12047,13 @@ index 42edd07a04..125857242f 100644
  TritonCTS::TritonCTS(utl::Logger* logger,
                       odb::dbDatabase* db,
                       sta::dbNetwork* network,
-@@ -90,6 +137,42 @@ void TritonCTS::runTritonCts()
+@@ -90,6 +144,42 @@ void TritonCTS::runTritonCts()
    options_->addOwner(block);
  
    setupCharacterization();
 +
 +  // Tier database from ODB; a database that already holds skew targets
-+  // (load_skew_targets / solve_skew_lp) is kept.
++  // (solve_skew_lp) is kept.
 +  const bool hadPreloadedDb = (cts3dDb_ != nullptr);
 +  if (!hadPreloadedDb) {
 +    cts3dDb_ = std::make_unique<Cts3DDatabase>(db_, logger_);
@@ -12284,7 +12090,7 @@ index 42edd07a04..125857242f 100644
    findClockRoots();
    populateTritonCTS();
    if (builders_.empty()) {
-@@ -107,6 +190,10 @@ void TritonCTS::runTritonCts()
+@@ -107,6 +197,10 @@ void TritonCTS::runTritonCts()
  
    // reset
    techChar_.reset();
@@ -12295,7 +12101,7 @@ index 42edd07a04..125857242f 100644
    builders_.clear();
    staClockNets_.clear();
    visitedClockNets_.clear();
-@@ -296,6 +383,9 @@ void TritonCTS::buildClockTrees()
+@@ -296,6 +390,9 @@ void TritonCTS::buildClockTrees()
  {
    for (auto& builder : builders_) {
      builder->setTechChar(*techChar_);
@@ -12305,16 +12111,16 @@ index 42edd07a04..125857242f 100644
      builder->setDb(db_);
      builder->setLogger(logger_);
      builder->initBlockages();
-@@ -356,6 +446,8 @@ void TritonCTS::initOneClockTree(odb::dbNet* driverNet,
+@@ -356,6 +453,8 @@ void TritonCTS::initOneClockTree(odb::dbNet* driverNet,
    }
  }
  
-+// Iterative (explicit stack) traversal: deep clock trees of large designs
-+// overflow the call stack with a recursive walk.
++// Iterative traversal with an explicit stack (the depth of the clock tree is
++// not limited by the call stack).
  void TritonCTS::countSinksPostDbWrite(
      TreeBuilder* builder,
      odb::dbNet* net,
-@@ -370,128 +462,117 @@ void TritonCTS::countSinksPostDbWrite(
+@@ -370,128 +469,117 @@ void TritonCTS::countSinksPostDbWrite(
      const std::unordered_set<odb::dbITerm*>& sinks,
      const std::unordered_set<odb::dbInst*>& dummies)
  {
@@ -12503,7 +12309,7 @@ index 42edd07a04..125857242f 100644
  }
  
  ClockInst* TritonCTS::getClockFromInst(odb::dbInst* inst)
-@@ -561,6 +642,128 @@ void TritonCTS::writeDataToDb()
+@@ -561,6 +649,128 @@ void TritonCTS::writeDataToDb()
        }
      }
    }
@@ -12592,7 +12398,7 @@ index 42edd07a04..125857242f 100644
 +            break;
 +          }
 +        }
-+        net = up;  // nullptr -> dangling driver input, loop exits
++        net = up;  // nullptr: dangling driver input, loop exits
 +      }
 +      if (!rooted) {
 +        ++unrootedMacroPins;
@@ -12632,7 +12438,7 @@ index 42edd07a04..125857242f 100644
  }
  
  void TritonCTS::forEachBuilder(
-@@ -1346,8 +1549,44 @@ TreeBuilder* TritonCTS::initClockTreeForMacrosAndRegs(
+@@ -1346,8 +1556,44 @@ TreeBuilder* TritonCTS::initClockTreeForMacrosAndRegs(
      return nullptr;
    }
  
@@ -12679,7 +12485,7 @@ index 42edd07a04..125857242f 100644
      // There is no need for separate clock trees
      for (odb::dbITerm* iterm : firstNet->getITerms()) {
        odb::dbInst* inst = iterm->getInst();
-@@ -1445,10 +1684,27 @@ bool TritonCTS::separateMacroRegSinks(
+@@ -1445,10 +1691,27 @@ bool TritonCTS::separateMacroRegSinks(
        if (libertyCell && libertyCell->isInverter()) {
          odb::dbITerm* invertedTerm
              = inst->getFirstOutput()->getNet()->get1stSignalInput(false);
@@ -12709,7 +12515,7 @@ index 42edd07a04..125857242f 100644
          macroSinks.emplace_back(inst, mterm);
        } else {
          registerSinks.emplace_back(inst, mterm);
-@@ -1596,6 +1852,15 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1596,6 +1859,15 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
  {
    Clock& clockNet = builder->getClock();
    odb::dbNet* topClockNet = clockNet.getNetObj();
@@ -12725,7 +12531,7 @@ index 42edd07a04..125857242f 100644
    // gets the module for the driver for the net
    sta::Pin* pin_driver = nullptr;
    odb::dbModule* top_module = network_->getNetDriverParentModule(
-@@ -1603,11 +1868,6 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1603,11 +1875,6 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
    (void) pin_driver;
  
    disconnectAllSinksFromNet(topClockNet);
@@ -12737,7 +12543,7 @@ index 42edd07a04..125857242f 100644
    destroyClockModNet(pin_driver);
  
    // re-connect top buffer that separates macros from registers
-@@ -1617,16 +1877,47 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1617,16 +1884,47 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      if (topRegBuffer) {
        odb::dbITerm* topRegBufferInputPin = getFirstInput(topRegBuffer);
        topRegBufferInputPin->connect(builder->getDrivingNet());
@@ -12790,7 +12596,7 @@ index 42edd07a04..125857242f 100644
    topClockNet->setSigType(odb::dbSigType::CLOCK);
  
    std::map<int, int> fanoutcount;
-@@ -1640,9 +1931,29 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1640,9 +1938,29 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      bool outputPinFound = true;
      bool inputPinFound = true;
      bool leafLevelNet = subNet.isLeafLevel();
@@ -12821,7 +12627,7 @@ index 42edd07a04..125857242f 100644
      odb::dbNet* clkSubNet
          = odb::dbNet::create(block_, subNet.getName().c_str());
      subNet.setNetObj(clkSubNet);
-@@ -1652,7 +1963,7 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1652,7 +1970,7 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
  
      odb::dbInst* driver = subNet.getDriver()->getDbInst();
      odb::dbITerm* driverInputPin = getFirstInput(driver);
@@ -12830,7 +12636,7 @@ index 42edd07a04..125857242f 100644
      odb::dbITerm* outputPin = driver->getFirstOutput();
      if (outputPin == nullptr) {
        outputPinFound = false;
-@@ -1666,6 +1977,10 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1666,6 +1984,10 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      }
  
      subNet.forEachSink([&](ClockInst* inst) {
@@ -12841,7 +12647,7 @@ index 42edd07a04..125857242f 100644
        odb::dbITerm* inputPin = nullptr;
        if (inst->isClockBuffer()) {
          odb::dbInst* sink = inst->getDbInst();
-@@ -1702,14 +2017,17 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1702,14 +2024,16 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      }
  
      if (!inputPinFound || !outputPinFound) {
@@ -12853,8 +12659,7 @@ index 42edd07a04..125857242f 100644
 -      odb::dbInst::destroy(driver);
 -      removedSinks.insert(subNet.getDriver());
 -      checkUpstreamConnections(inputNet);
-+      // Net not fully connected.  It is kept: destroying it (and walking the
-+      // upstream nets) can touch objects that were already freed.
++      // A net that is not fully connected is reported and kept in ODB.
 +      logger_->warn(CTS,
 +                    885,
 +                    "  Disconnected subnet '{}' (driver='{}', "
@@ -12867,7 +12672,7 @@ index 42edd07a04..125857242f 100644
      }
    });
  
-@@ -1734,6 +2052,34 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1734,6 +2058,34 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      }
    });
  
@@ -12902,7 +12707,7 @@ index 42edd07a04..125857242f 100644
    logger_->info(
        CTS, 12, "    Minimum number of buffers in the clock path: {}.", minPath);
    logger_->info(
-@@ -1987,7 +2333,14 @@ std::pair<int, int> TritonCTS::branchBufferCount(ClockInst* inst,
+@@ -1987,7 +2339,14 @@ std::pair<int, int> TritonCTS::branchBufferCount(ClockInst* inst,
                                                   Clock& clockNet)
  {
    odb::dbInst* sink = inst->getDbInst();
@@ -12917,7 +12722,7 @@ index 42edd07a04..125857242f 100644
    int minPath = std::numeric_limits<int>::max();
    int maxPath = std::numeric_limits<int>::min();
    for (odb::dbITerm* sinkITerms : outITerm->getNet()->getITerms()) {
-@@ -2051,11 +2404,43 @@ void TritonCTS::checkUpstreamConnections(odb::dbNet* net)
+@@ -2051,11 +2410,43 @@ void TritonCTS::checkUpstreamConnections(odb::dbNet* net)
  
  void TritonCTS::createClockBuffers(Clock& clockNet, odb::dbModule* parent)
  {
@@ -12961,7 +12766,7 @@ index 42edd07a04..125857242f 100644
      newInst->setSourceType(odb::dbSourceType::TIMING);
      inst.setInstObj(newInst);
      inst2clkbuf_[newInst] = &inst;
-@@ -2152,7 +2537,7 @@ bool TritonCTS::isSink(odb::dbITerm* iterm)
+@@ -2152,7 +2543,7 @@ bool TritonCTS::isSink(odb::dbITerm* iterm)
      return true;
    }
  
@@ -12970,7 +12775,7 @@ index 42edd07a04..125857242f 100644
      return true;
    }
  
-@@ -2250,19 +2635,38 @@ static float getInputCap(const sta::LibertyCell* cell)
+@@ -2250,19 +2641,38 @@ static float getInputCap(const sta::LibertyCell* cell)
    return 0.0;
  }
  
@@ -13011,7 +12816,7 @@ index 42edd07a04..125857242f 100644
    return bestCell;
  }
  
-@@ -2283,7 +2687,7 @@ int TritonCTS::writeDummyLoadsToDb(Clock& clockNet,
+@@ -2283,7 +2693,7 @@ int TritonCTS::writeDummyLoadsToDb(Clock& clockNet,
    int nDummies = 0;
    clockNet.forEachSubNet([&](ClockSubNet& subNet) {
      subNet.forEachSink([&](ClockInst* inst) {
@@ -13020,7 +12825,7 @@ index 42edd07a04..125857242f 100644
            && !sta::fuzzyEqual(inst->getOutputCap(),
                                inst->getIdealOutputCap())) {
          odb::dbInst* dummyInst
-@@ -2314,6 +2718,9 @@ bool TritonCTS::computeIdealOutputCaps(Clock& clockNet)
+@@ -2314,6 +2724,9 @@ bool TritonCTS::computeIdealOutputCaps(Clock& clockNet)
      driver2subnet_[driver] = &subNet;
      float sinkCapTotal = 0.0;
      subNet.forEachSink([&](ClockInst* inst) {
@@ -13030,7 +12835,7 @@ index 42edd07a04..125857242f 100644
        odb::dbITerm* inputPin = inst->isClockBuffer()
                                     ? getFirstInput(inst->getDbInst())
                                     : inst->getDbInputPin();
-@@ -2469,7 +2876,20 @@ odb::dbInst* TritonCTS::insertDummyCell(
+@@ -2469,7 +2882,20 @@ odb::dbInst* TritonCTS::insertDummyCell(
      return nullptr;
    }
    float deltaCap = inst->getIdealOutputCap() - inst->getOutputCap();
@@ -13052,7 +12857,7 @@ index 42edd07a04..125857242f 100644
    // clang-format off
    debugPrint(logger_, CTS, "dummy load", 1, "insertDummyCell {} at {}",
               inst->getName(), dummyCell->name());
-@@ -2501,10 +2921,34 @@ ClockInst& TritonCTS::placeDummyCell(Clock& clockNet,
+@@ -2501,10 +2927,34 @@ ClockInst& TritonCTS::placeDummyCell(Clock& clockNet,
        = options_->getDummyLoadPrefix() + std::to_string(dummyLoadIndex_++);
    dummyInst = odb::dbInst::create(block_, master, cellName.c_str());
    dummyInst->setSourceType(odb::dbSourceType::TIMING);
@@ -13089,12 +12894,11 @@ index 42edd07a04..125857242f 100644
    // clang-format off
    debugPrint(logger_, CTS, "dummy load", 1, "  placed dummy instance {} at {}",
               dummyInst->getName(), dummyInst->getLocation());
-@@ -2596,4 +3040,167 @@ void TritonCTS::balanceMacroRegisterLatencies()
+@@ -2596,4 +3046,144 @@ void TritonCTS::balanceMacroRegisterLatencies()
    }
  }
  
-+// Register -> register timing graph.  Only EXTRACT_MODE=sta_validated (native
-+// constrained PathEnds) is supported.
++// Register -> register timing graph (native constrained PathEnds of OpenSTA).
 +void TritonCTS::extractFFGraphFromODB(const std::string& output_file)
 +{
 +  logger_->report("Register timing graph extraction -> {}", output_file);
@@ -13106,12 +12910,6 @@ index 42edd07a04..125857242f 100644
 +
 +  extractor.collectRegisters();
 +
-+  const char* ext_mode = std::getenv("EXTRACT_MODE");
-+  const std::string mode = ext_mode ? ext_mode : "";
-+  if (mode != "sta_validated") {
-+    logger_->error(
-+        utl::CTS, 972, "Timing graph extraction requires EXTRACT_MODE=sta_validated");
-+  }
 +  auto edges = extractor.extractRegisterEdges();
 +  extractor.writeCSV(edges, output_file);
 +
@@ -13137,22 +12935,10 @@ index 42edd07a04..125857242f 100644
 +  logger_->report("IO timing edges written to {}", output_file);
 +}
 +
-+void TritonCTS::loadSkewTargets(const std::string& csv_path)
-+{
-+  // May be called before runTritonCts.
-+  if (!cts3dDb_) {
-+    cts3dDb_ = std::make_unique<Cts3DDatabase>(db_, logger_);
-+    cts3dDb_->populate();
-+  }
-+  cts3dDb_->loadSkewTargets(csv_path);
-+}
-+
-+// Skew-scheduling LP.  Graph inputs: CTS_FF_TIMING_GRAPH_CSV and
-+// CTS_IO_TIMING_EDGES_CSV (default $RESULTS_DIR/pre_cts_ff_timing_graph.csv and
-+// $RESULTS_DIR/pre_cts_io_timing_edges.csv).  The targets are stored in the
++// Skew-scheduling LP.  Graph inputs: $RESULTS_DIR/pre_cts_ff_timing_graph.csv
++// and $RESULTS_DIR/pre_cts_io_timing_edges.csv.  The targets are stored in the
 +// tier database (used by the next clock_tree_synthesis) and written to
-+// CTS_SKEW_TARGETS_CSV (default $RESULTS_DIR/pre_cts_skew_targets.csv).
-+// CTS_LP_WNS_ALPHA (default 0.05) relaxes the phase-A WNS in phase B.
++// $RESULTS_DIR/pre_cts_skew_targets.csv.
 +void TritonCTS::solveSkewLp(float sigma_local,
 +                            float sigma_pi,
 +                            float lambda_reg,
@@ -13178,23 +12964,13 @@ index 42edd07a04..125857242f 100644
 +  params.gamma_wns = gamma_wns;
 +  params.weight_io = weight_io;
 +  params.max_skew = max_skew;
-+  const char* wns_alpha_env = std::getenv("CTS_LP_WNS_ALPHA");
-+  params.wns_alpha = wns_alpha_env ? std::stof(wns_alpha_env)
-+                                   : kDefaultLpWnsAlpha;
 +  lp_solver.setParams(params);
 +
 +  const char* results_dir = std::getenv("RESULTS_DIR");
 +  const std::string res_base = results_dir ? std::string(results_dir) : ".";
-+  auto envPath = [&](const char* name, const char* file) {
-+    const char* v = std::getenv(name);
-+    return v ? std::string(v) : res_base + "/" + file;
-+  };
-+  const std::string graph_csv
-+      = envPath("CTS_FF_TIMING_GRAPH_CSV", "pre_cts_ff_timing_graph.csv");
-+  const std::string io_csv
-+      = envPath("CTS_IO_TIMING_EDGES_CSV", "pre_cts_io_timing_edges.csv");
-+  const std::string targets_csv
-+      = envPath("CTS_SKEW_TARGETS_CSV", "pre_cts_skew_targets.csv");
++  const std::string graph_csv = res_base + "/pre_cts_ff_timing_graph.csv";
++  const std::string io_csv = res_base + "/pre_cts_io_timing_edges.csv";
++  const std::string targets_csv = res_base + "/pre_cts_skew_targets.csv";
 +
 +  // One LP over all registers of all clock nets: CTS may split one SDC clock
 +  // into several clock nets (macro / register trees), and their paths share
@@ -13251,6 +13027,12 @@ index 42edd07a04..125857242f 100644
 +      db_, openSta_, network_, estimate_parasitics_, logger_);
 +}
 +
++std::string TritonCTS::relocEvalMetrics(const std::string& moved, int mode)
++{
++  return cts::relocEvalMetrics(
++      db_, openSta_, network_, estimate_parasitics_, logger_, moved, mode);
++}
++
 +void TritonCTS::predictClockArrivals(const char* output_csv)
 +{
 +  runStagePredictor(db_, openSta_, logger_, output_csv);
@@ -13258,7 +13040,7 @@ index 42edd07a04..125857242f 100644
 +
  }  // namespace cts
 diff --git a/src/cts/src/TritonCTS.i b/src/cts/src/TritonCTS.i
-index ba0b7ce2d3..e84e0ba959 100644
+index ba0b7ce2d3..f9b42313bd 100644
 --- a/src/cts/src/TritonCTS.i
 +++ b/src/cts/src/TritonCTS.i
 @@ -8,6 +8,8 @@
@@ -13270,7 +13052,7 @@ index ba0b7ce2d3..e84e0ba959 100644
  #include "ord/OpenRoad.hh"
  
  namespace ord {
-@@ -498,4 +500,133 @@ reset_wire_segment_distance_unit()
+@@ -498,4 +500,140 @@ reset_wire_segment_distance_unit()
  {
    getTritonCts()->getParms()->resetWireSegmentUnit();
  }
@@ -13287,14 +13069,6 @@ index ba0b7ce2d3..e84e0ba959 100644
 +extract_io_timing_edges_odb(const char* output_file)
 +{
 +  getTritonCts()->extractIOTimingEdgesFromODB(output_file);
-+}
-+
-+// Per-register clock arrival targets (ff_name,target_ns) for the next
-+// clock_tree_synthesis.
-+void
-+load_skew_targets(const char* csv_file)
-+{
-+  getTritonCts()->loadSkewTargets(csv_file);
 +}
 +
 +// Per-register physical latency bounds (ff_name,tier,t_min_ns,t_max_ns).
@@ -13330,6 +13104,16 @@ index ba0b7ce2d3..e84e0ba959 100644
 +  getTritonCts()->runClockRefinement();
 +}
 +
++// Stage Q: setup/hold TNS/WNS (ps, "st sw ht hw") after moving the named instances; mode 0 whole-design
++// parasitics, 1 incremental (nets of the moved instances), 2 end.
++const char*
++reloc_eval_metrics(const char* moved, int mode)
++{
++  static std::string r;
++  r = getTritonCts()->relocEvalMetrics(moved, mode);
++  return r.c_str();
++}
++
 +// Clock-arrival prediction of the clock pins (CTS_STAGE_BOUNDARY_CSV optional).
 +void
 +predict_clock_arrivals(const char* output_csv)
@@ -13338,7 +13122,8 @@ index ba0b7ce2d3..e84e0ba959 100644
 +}
 +
 +// ---- early-clock decision (file based; the probe loop runs in Tcl in the same session)
-+// Scoped reference view of the OFF chain; returns the regular clock root.
++// Scoped view of the reference arm (tree without early clocks); returns the
++// regular clock root.
 +const char*
 +early_scope(const char* ref_arm, const char* plat, const char* des, const char* dump, const char* outview)
 +{
@@ -13347,14 +13132,15 @@ index ba0b7ce2d3..e84e0ba959 100644
 +  return root.c_str();
 +}
 +
-+// Calibration structures -> <outdir>/cands (probed by early_probe.tcl).
++// Calibration structures, written to <outdir>/cands (probed by early_probe.tcl).
 +void
 +early_calibrate_structures(const char* view, const char* plat, const char* des, const char* dump, const char* outdir, const char* root)
 +{
 +  cts::early::calibrate_structures(view, plat, des, dump, outdir, root);
 +}
 +
-+// Shift-model fit from the probe reports -> <outdir>/calib.json, calib_points.csv.
++// Shift-model fit from the probe reports, written to <outdir>/calib.json and
++// calib_points.csv.
 +void
 +early_calibrate_fit(const char* view, const char* plat, const char* des, const char* dump, const char* outdir, const char* root,
 +                    const char* probe_reports)
@@ -13372,7 +13158,8 @@ index ba0b7ce2d3..e84e0ba959 100644
 +  return status.c_str();
 +}
 +
-+// Hub candidates: generate -> <out>/cands, gen.csv; measure (probe reports) -> measured.csv.
++// Hub candidates: generate writes <out>/cands and gen.csv; measure reads the
++// probe reports and writes measured.csv.
 +void
 +early_hub_generate(const char* cas, const char* plat, const char* des, const char* view, const char* dump, const char* calib_dir,
 +                   const char* out, const char* hbt_nets, const char* setrc)
@@ -13387,7 +13174,8 @@ index ba0b7ce2d3..e84e0ba959 100644
 +  cts::early::hub_measure(cas, plat, des, view, dump, calib_dir, out, hbt_nets, setrc, probe_reports);
 +}
 +
-+// Hub selection -> <out>/plan.tsv, cid, select.json; returns the selected cid ("" = none).
++// Hub selection, written to <out>/plan.tsv, cid and select.json; returns the
++// selected cid ("" = none).
 +const char*
 +early_hub_select(const char* measured, const char* cands_dir, const char* out)
 +{
@@ -13396,7 +13184,8 @@ index ba0b7ce2d3..e84e0ba959 100644
 +  return cid.c_str();
 +}
 +
-+// Multi-hub prefixes k = 2..K -> <out>/plan_k<k>.tsv, prefixes.json.
++// Multi-hub prefixes k = 2..K, written to <out>/plan_k<k>.tsv and
++// prefixes.json.
 +void
 +early_hub_multi(const char* measured, const char* cands_dir, const char* out, int k)
 +{
@@ -13404,31 +13193,11 @@ index ba0b7ce2d3..e84e0ba959 100644
 +}
 +
  %} //inline
-diff --git a/src/dpl/include/dpl/Opendp.h b/src/dpl/include/dpl/Opendp.h
-index 8fd2f5375b..0d00ff983e 100644
---- a/src/dpl/include/dpl/Opendp.h
-+++ b/src/dpl/include/dpl/Opendp.h
-@@ -326,6 +326,11 @@ class Opendp
-   int max_displacement_x_ = 0;  // sites
-   int max_displacement_y_ = 0;  // sites
-   bool disallow_one_site_gaps_ = false;
-+
-+  // 3D-aware DPL: cells on different tiers can share the same (x,y) site
-+  bool enable_3d_dpl_ = false;
-+  // Get tier from cell master name: *_bottom* -> 0, *_upper* -> 1, else -1
-+  static int getCellTier(const Node* cell);
-   std::vector<Node*> placement_failures_;
- 
-   // 2D pixel grid
 diff --git a/src/dpl/src/CheckPlacement.cpp b/src/dpl/src/CheckPlacement.cpp
-index 5ba8f5d742..d6ffc67e0b 100644
+index 5ba8f5d742..e4dbb7cc1d 100644
 --- a/src/dpl/src/CheckPlacement.cpp
 +++ b/src/dpl/src/CheckPlacement.cpp
-@@ -4,9 +4,11 @@
- #include <cmath>
- #include <functional>
- #include <string>
-+#include <unordered_map>
+@@ -7,6 +7,7 @@
  #include <vector>
  
  #include "PlacementDRC.h"
@@ -13436,124 +13205,33 @@ index 5ba8f5d742..d6ffc67e0b 100644
  #include "dpl/Opendp.h"
  #include "infrastructure/Grid.h"
  #include "infrastructure/Objects.h"
-@@ -24,9 +26,32 @@ using utl::DPL;
- 
- using utl::format_as;  // NOLINT(misc-unused-using-decls)
- 
-+namespace {
-+// Second occupant per pixel (the first cell of the other tier that touched
-+// it) for the 3D overlap check, so a same-tier overlap is never masked by an
-+// earlier occupant of the other tier.  Cleared at the start of every check.
-+std::unordered_map<const Pixel*, const Node*> g_other_tier_occupant;
-+}  // namespace
-+
+@@ -27,6 +28,14 @@ using utl::format_as;  // NOLINT(misc-unused-using-decls)
  void Opendp::checkPlacement(const bool verbose,
                              const std::string& report_file_name)
  {
-+  // The tier rule is read here as well.  DPL_TIER_ONLY=<t> checks one tier
-+  // exactly (rows, sites, padding, overlap); DPL_3D=1 checks both tiers at
-+  // once with per-tier pixel occupants.
++  // The tier rule is read here as well: DPL_TIER_ONLY=<t> checks one tier
++  // exactly (rows, sites, padding, overlap).
 +  tier::setTierOnly(tier::envTierOnly());
 +  tier::CommandScope tier_scope;
-+  enable_3d_dpl_ = tier::tierOnly() < 0 && tier::env3d();
-+  g_other_tier_occupant.clear();
 +  if (tier::tierOnly() >= 0) {
 +    logger_->info(
 +        DPL, 2102, "DPL_TIER_ONLY: checking tier {} only.", tier::tierOnly());
-+  } else if (enable_3d_dpl_) {
-+    logger_->info(DPL,
-+                  2103,
-+                  "3D check: per-tier pixel occupants; padding is checked "
-+                  "per tier with DPL_TIER_ONLY.");
 +  }
    importDb();
    adjustNodesOrient();
  
-@@ -70,8 +95,9 @@ void Opendp::checkPlacement(const bool verbose,
-     if (checkOverlap(*cell)) {
-       overlap_failures.push_back(cell.get());
-     }
--    // Padding check
--    if (!drc_engine_->checkPadding(cell.get())) {
-+    // Padding check (skipped in the all-tier 3D check, where the grid mixes
-+    // tiers; use DPL_TIER_ONLY)
-+    if (!enable_3d_dpl_ && !drc_engine_->checkPadding(cell.get())) {
-       padding_failures.emplace_back(cell.get());
-     }
-     grid_->paintCellPadding(cell.get());
-@@ -363,6 +389,19 @@ const Node* Opendp::checkOverlap(Node& cell) const
-     if (pixel_cell) {
-       if (pixel_cell != &cell && overlap(&cell, pixel_cell)) {
-         overlap_cell = pixel_cell;
-+      } else if (enable_3d_dpl_ && pixel_cell != &cell) {
-+        // The pixel is held by a cell of the other tier: compare with (or
-+        // record) the occupant of this cell's own tier, so that a same-tier
-+        // overlap behind an occupant of the other tier is still found.
-+        const int my_tier = getCellTier(&cell);
-+        if (my_tier >= 0 && getCellTier(pixel_cell) != my_tier) {
-+          auto it = g_other_tier_occupant.find(pixel);
-+          if (it == g_other_tier_occupant.end()) {
-+            g_other_tier_occupant.emplace(pixel, &cell);
-+          } else if (it->second != &cell && overlap(&cell, it->second)) {
-+            overlap_cell = it->second;
-+          }
-+        }
-       }
-     } else {
-       pixel->cell = &cell;
-@@ -378,6 +417,15 @@ bool Opendp::overlap(const Node* cell1, const Node* cell2) const
-     return false;
-   }
- 
-+  // 3D-aware DPL: cells on different tiers don't overlap in 3D
-+  if (enable_3d_dpl_) {
-+    const int tier1 = getCellTier(cell1);
-+    const int tier2 = getCellTier(cell2);
-+    if (tier1 >= 0 && tier2 >= 0 && tier1 != tier2) {
-+      return false;
-+    }
-+  }
-+
-   const DbuPt ll1 = initialLocation(cell1, false);
-   const DbuPt ll2 = initialLocation(cell2, false);
-   DbuPt ur1, ur2;
-@@ -389,6 +437,8 @@ bool Opendp::overlap(const Node* cell1, const Node* cell2) const
- Node* Opendp::checkOneSiteGaps(Node& cell) const
- {
-   Node* gap_cell = nullptr;
-+  // 3D-aware DPL: get tier of cell being checked
-+  const int my_tier = enable_3d_dpl_ ? getCellTier(&cell) : -1;
-   grid_->visitCellBoundaryPixels(
-       cell, [&](Pixel* pixel, const Direction2D& edge, GridX x, GridY y) {
-         GridX abut_x{0};
-@@ -406,11 +456,23 @@ Node* Opendp::checkOneSiteGaps(Node& cell) const
-         }
-         // check the abutting pixel
-         const Pixel* abut_pixel = grid_->gridPixel(x + abut_x, y);
--        const bool abuttment_exists = (abut_pixel && abut_pixel->cell);
-+        // 3D-aware: different-tier cell in abutting pixel counts as abutment
-+        bool abuttment_exists = (abut_pixel && abut_pixel->cell);
-+        if (enable_3d_dpl_ && abuttment_exists && my_tier >= 0
-+            && abut_pixel->cell_tier >= 0
-+            && my_tier != abut_pixel->cell_tier) {
-+          abuttment_exists = false;  // different tier — not real abutment
-+        }
+@@ -410,7 +419,8 @@ Node* Opendp::checkOneSiteGaps(Node& cell) const
          if (!abuttment_exists) {
            // check the 1 site gap pixel
            const Pixel* gap_pixel = grid_->gridPixel(x + GridX{2 * abut_x.v}, y);
 -          if (gap_pixel) {
++          // an empty gap pixel never replaces a found gap cell
 +          if (gap_pixel && gap_pixel->cell) {
-+            // 3D-aware: skip gap violation if gap cell is on different tier
-+            if (enable_3d_dpl_ && my_tier >= 0
-+                && gap_pixel->cell_tier >= 0
-+                && my_tier != gap_pixel->cell_tier) {
-+              return;  // different tier — not a real one-site gap
-+            }
              gap_cell = gap_pixel->cell;
            }
          }
 diff --git a/src/dpl/src/Opendp.cpp b/src/dpl/src/Opendp.cpp
-index d343020424..afc457fb68 100644
+index d343020424..6c637c71b2 100644
 --- a/src/dpl/src/Opendp.cpp
 +++ b/src/dpl/src/Opendp.cpp
 @@ -14,6 +14,7 @@
@@ -13564,7 +13242,7 @@ index d343020424..afc457fb68 100644
  #include "boost/geometry/geometry.hpp"
  #include "dpl/OptMirror.h"
  #include "graphics/DplObserver.h"
-@@ -29,6 +30,88 @@
+@@ -29,6 +30,76 @@
  #include "util/journal.h"
  #include "utl/Logger.h"
  
@@ -13601,18 +13279,6 @@ index d343020424..afc457fb68 100644
 +  }
 +  const std::string s(v);
 +  return s == "0" ? 0 : (s == "1" ? 1 : -1);
-+}
-+
-+bool env3d()
-+{
-+  const char* v = std::getenv("DPL_3D");
-+  return v != nullptr && std::string(v) == "1";
-+}
-+
-+bool envPerTier()
-+{
-+  const char* v = std::getenv("DPL_3D_PER_TIER");
-+  return v == nullptr || std::string(v) != "0";
 +}
 +
 +int tierOnly()
@@ -13653,37 +13319,12 @@ index d343020424..afc457fb68 100644
  namespace dpl {
  
  using std::round;
-@@ -106,8 +189,55 @@ void Opendp::detailedPlacement(const int max_displacement_x,
+@@ -106,8 +177,22 @@ void Opendp::detailedPlacement(const int max_displacement_x,
                                 const int max_displacement_y,
                                 const std::string& report_file_name)
  {
-+  // DPL_3D=1 (and DPL_3D_PER_TIER != 0): legalize each tier in its own
-+  // single-tier pass.  The one-grid 3D mode keeps one occupant per pixel and
-+  // can lose a same-tier occupant under one of the other tier; a single-tier
-+  // pass has no such ambiguity and still lets the tiers share XY.
-+  static bool tier_in_pass = false;
-+  if (!tier_in_pass && tier::envTierOnly() < 0 && tier::env3d()
-+      && tier::envPerTier()) {
-+    tier_in_pass = true;
-+    try {
-+      for (int t = 0; t <= 1; ++t) {
-+        tier::setTierOnly(t);
-+        logger_->info(
-+            DPL, 2100, "3D DPL: single-tier legalization pass, tier {}.", t);
-+        detailedPlacement(max_displacement_x, max_displacement_y, report_file_name);
-+      }
-+    } catch (...) {
-+      tier_in_pass = false;
-+      tier::restoreMasterTypes();
-+      tier::setTierOnly(-1);
-+      throw;
-+    }
-+    tier_in_pass = false;
-+    return;
-+  }
-+  if (!tier_in_pass) {
-+    tier::setTierOnly(tier::envTierOnly());
-+  }
++  // DPL_TIER_ONLY=<t>: legalize the cells of tier t only (the other tier is invisible)
++  tier::setTierOnly(tier::envTierOnly());
 +  const int selected_tier = tier::tierOnly();
 +  // restores COVER masters and the tier selection on exit or error
 +  tier::CommandScope tier_scope;
@@ -13698,159 +13339,15 @@ index d343020424..afc457fb68 100644
    importDb();
    adjustNodesOrient();
 +
-+  // One-grid 3D mode (DPL_3D=1 outside a single-tier pass): cells on
-+  // different tiers may share the same (x,y) site.  Inside a single-tier pass
-+  // the grid holds one tier only.
-+  enable_3d_dpl_ = selected_tier < 0 && tier::env3d();
-+  if (enable_3d_dpl_) {
-+    logger_->info(DPL, 57, "3D-aware DPL enabled: cross-tier overlap allowed.");
-+  }
-+
    for (const auto& node : network_->getNodes()) {
      if (node->getType() == Node::CELL && !node->isFixed()) {
        node->setPlaced(false);
-@@ -296,12 +426,33 @@ void Opendp::setGridCell(Node& cell, Pixel* pixel)
- {
-   pixel->cell = &cell;
-   pixel->util = 1.0;
-+  // 3D-aware DPL: record tier of the cell occupying this pixel
-+  if (enable_3d_dpl_) {
-+    pixel->cell_tier = getCellTier(&cell);
-+  }
-   if (cell.isBlock()) {
-     // Try the is_hopeless strategy to get off of a block
-     pixel->is_hopeless = true;
-   }
- }
- 
-+// Determine cell tier from master name suffix:
-+//   *bottom* -> tier 0, *upper* -> tier 1, else -1
-+int Opendp::getCellTier(const Node* cell)
-+{
-+  if (!cell || !cell->getDbInst()) {
-+    return -1;
-+  }
-+  const char* master_name = cell->getDbInst()->getMaster()->getConstName();
-+  if (std::strstr(master_name, "bottom")) {
-+    return 0;
-+  }
-+  if (std::strstr(master_name, "upper")) {
-+    return 1;
-+  }
-+  return -1;
-+}
-+
- void Opendp::groupAssignCellRegions()
- {
-   const int64_t site_width = grid_->getSiteWidth().v;
-diff --git a/src/dpl/src/Place.cpp b/src/dpl/src/Place.cpp
-index dfa431ce4e..15c3ef0525 100644
---- a/src/dpl/src/Place.cpp
-+++ b/src/dpl/src/Place.cpp
-@@ -650,6 +650,8 @@ bool Opendp::shiftMove(Node* cell)
-   // magic number alert
-   const GridY boundary_margin{3};
-   const GridX margin_width{grid_->gridPaddedWidth(cell).v * boundary_margin.v};
-+  // 3D-aware: only consider same-tier cells for shift
-+  const int shift_tier = enable_3d_dpl_ ? getCellTier(cell) : -1;
-   std::set<Node*> region_cells;
-   for (GridX x = grid_pt.x - margin_width; x < grid_pt.x + margin_width; x++) {
-     for (GridY y = grid_pt.y - boundary_margin; y < grid_pt.y + boundary_margin;
-@@ -658,6 +660,11 @@ bool Opendp::shiftMove(Node* cell)
-       if (pixel) {
-         Node* cell = pixel->cell;
-         if (cell && !cell->isFixed()) {
-+          // 3D: skip cells on different tier
-+          if (enable_3d_dpl_ && shift_tier >= 0 && pixel->cell_tier >= 0
-+              && shift_tier != pixel->cell_tier) {
-+            continue;
-+          }
-           region_cells.insert(cell);
-         }
-       }
-@@ -687,6 +694,14 @@ bool Opendp::shiftMove(Node* cell)
- 
- bool Opendp::swapCells(Node* cell1, Node* cell2)
- {
-+  // 3D-aware DPL: do not swap cells across different tiers
-+  if (enable_3d_dpl_) {
-+    const int t1 = getCellTier(cell1);
-+    const int t2 = getCellTier(cell2);
-+    if (t1 >= 0 && t2 >= 0 && t1 != t2) {
-+      return false;
-+    }
-+  }
-   if (cell1 != cell2 && !cell1->isHold() && !cell2->isHold()
-       && cell1->getWidth() == cell2->getWidth()
-       && cell1->getHeight() == cell2->getHeight() && !cell1->isFixed()
-@@ -952,16 +967,28 @@ bool Opendp::checkPixels(const Node* cell,
-   }
- 
-   odb::dbSite* site = cell->getSite();
-+  // 3D-aware DPL: determine tier of the cell being placed
-+  const int my_tier = enable_3d_dpl_ ? getCellTier(cell) : -1;
-   for (GridY y1 = y; y1 < y_end; y1++) {
-     const bool first_row = (y1 == y);
-     for (GridX x1 = x; x1 < x_end; x1++) {
-       const Pixel* pixel = grid_->gridPixel(x1, y1);
--      if (pixel == nullptr || pixel->cell || !pixel->is_valid
-+      if (pixel == nullptr || !pixel->is_valid
-           || (cell->inGroup() && pixel->group != cell->getGroup())
-           || (!cell->inGroup() && pixel->group)
-           || (first_row && !grid_->getSiteOrientation(x1, y1, site))) {
-         return false;
-       }
-+      // 3D-aware overlap check: pixel occupied by a cell
-+      if (pixel->cell) {
-+        if (enable_3d_dpl_ && my_tier >= 0 && pixel->cell_tier >= 0
-+            && my_tier != pixel->cell_tier) {
-+          // Different tier — not a real overlap in 3D, skip
-+          continue;
-+        }
-+        // Same tier or tier unknown — real overlap
-+        return false;
-+      }
-     }
-   }
- 
-@@ -976,14 +1003,27 @@ bool Opendp::checkPixels(const Node* cell,
-     const GridX x_finish = min(x_end, grid_->getRowSiteCount() - 1);
-     const GridY y_finish = min(y_end, grid_->getRowCount() - 1);
- 
--    auto isAbutted = [this](const GridX x, const GridY y) {
-+    auto isAbutted = [this, my_tier](const GridX x, const GridY y) {
-       const Pixel* pixel = grid_->gridPixel(x, y);
--      return (pixel == nullptr || pixel->cell);
-+      if (pixel == nullptr) return true;
-+      if (!pixel->cell) return false;
-+      // 3D: different-tier cell doesn't count as abutting
-+      if (enable_3d_dpl_ && my_tier >= 0 && pixel->cell_tier >= 0
-+          && my_tier != pixel->cell_tier) {
-+        return false;
-+      }
-+      return true;
-     };
- 
--    auto cellAtSite = [this](const GridX x, const GridY y) {
-+    auto cellAtSite = [this, my_tier](const GridX x, const GridY y) {
-       const Pixel* pixel = grid_->gridPixel(x, y);
--      return (pixel != nullptr && pixel->cell);
-+      if (pixel == nullptr || !pixel->cell) return false;
-+      // 3D: different-tier cell doesn't count
-+      if (enable_3d_dpl_ && my_tier >= 0 && pixel->cell_tier >= 0
-+          && my_tier != pixel->cell_tier) {
-+        return false;
-+      }
-+      return true;
-     };
-     for (GridY y = y_begin; y < y_finish; ++y) {
-       // left side
 diff --git a/src/dpl/src/TierLegalize.h b/src/dpl/src/TierLegalize.h
 new file mode 100644
-index 0000000000..17a63d8d42
+index 0000000000..21c9684f4b
 --- /dev/null
 +++ b/src/dpl/src/TierLegalize.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,49 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2019-2025, The OpenROAD Authors
 +//
@@ -13864,12 +13361,6 @@ index 0000000000..17a63d8d42
 +//                        Legalization and checking are then single-tier
 +//                        operations: same-tier overlaps are illegal, cells of
 +//                        the other tier are invisible (same XY allowed).
-+//   DPL_3D=1             detailed_placement runs one single-tier pass per tier
-+//                        (DPL_3D_PER_TIER=0 selects the one-grid mode, in which
-+//                        cells of different tiers may share a site);
-+//                        check_placement keeps one occupant per tier and
-+//                        pixel, so a same-tier overlap cannot be masked by an
-+//                        occupant of the other tier.
 +#pragma once
 +
 +namespace odb {
@@ -13879,14 +13370,9 @@ index 0000000000..17a63d8d42
 +namespace dpl::tier {
 +
 +// tier from the master name: "*bottom*" -> 0, "*upper*" -> 1, otherwise -1
-+// (same rule as Opendp::getCellTier)
 +int tierOfMasterName(const char* name);
 +// DPL_TIER_ONLY from the environment (-1 when unset or invalid)
 +int envTierOnly();
-+// DPL_3D == "1"
-+bool env3d();
-+// per-tier passes in 3D mode (DPL_3D_PER_TIER != "0")
-+bool envPerTier();
 +// currently selected tier of this command (-1 = all tiers)
 +int tierOnly();
 +void setTierOnly(int tier);
@@ -13944,73 +13430,6 @@ index aa5a437816..456b7f94d2 100644
      // Skip instances which are not placeable.
      if (!inst->getMaster()->isCoreAutoPlaceable()) {
        continue;
-diff --git a/src/dpl/src/infrastructure/Grid.cpp b/src/dpl/src/infrastructure/Grid.cpp
-index c973625f41..130836895b 100644
---- a/src/dpl/src/infrastructure/Grid.cpp
-+++ b/src/dpl/src/infrastructure/Grid.cpp
-@@ -5,6 +5,7 @@
- 
- #include <algorithm>
- #include <cmath>
-+#include <cstring>
- #include <functional>
- #include <limits>
- #include <memory>
-@@ -81,6 +82,7 @@ void Grid::allocateGrid()
-       pixel.is_valid = false;
-       pixel.is_hopeless = false;
-       pixel.blocked_layers = 0;
-+      pixel.cell_tier = -1;
-     }
-   }
- 
-@@ -433,6 +435,7 @@ void Grid::erasePixel(Node* cell)
-       if (pixel->cell == cell) {
-         pixel->cell = nullptr;
-         pixel->util = 0;
-+        pixel->cell_tier = -1;
-       }
- 
-       // Clear padding reservations made by this cell
-@@ -450,6 +453,16 @@ void Grid::paintPixel(Node* cell, GridX grid_x, GridY grid_y)
-   GridY cell_y_end = gridEndY(gridYToDbu(grid_y) + cell->getHeight());
- 
-   // Mark actual cell pixels
-+  // 3D-aware DPL: determine tier from cell master name
-+  int paint_tier = -1;
-+  if (cell && cell->getDbInst()) {
-+    const char* mname = cell->getDbInst()->getMaster()->getConstName();
-+    if (std::strstr(mname, "bottom")) {
-+      paint_tier = 0;
-+    } else if (std::strstr(mname, "upper")) {
-+      paint_tier = 1;
-+    }
-+  }
-   for (GridX x{grid_x}; x < cell_x_end; x++) {
-     for (GridY y{grid_y}; y < cell_y_end; y++) {
-       Pixel* pixel = gridPixel(x, y);
-@@ -458,6 +471,7 @@ void Grid::paintPixel(Node* cell, GridX grid_x, GridY grid_y)
-       }
-       pixel->cell = cell;
-       pixel->util = 1.0;
-+      pixel->cell_tier = paint_tier;
-     }
-   }
- 
-diff --git a/src/dpl/src/infrastructure/Grid.h b/src/dpl/src/infrastructure/Grid.h
-index 05ad0e3cc9..eb2cd4b695 100644
---- a/src/dpl/src/infrastructure/Grid.h
-+++ b/src/dpl/src/infrastructure/Grid.h
-@@ -46,6 +46,9 @@ struct Pixel
-   uint8_t blocked_layers = 0;
-   // Cell that reserved this pixel for padding
-   Node* padding_reserved_by = nullptr;
-+  // 3D-aware DPL: tier of the cell occupying this pixel
-+  // -1 = unknown/unset, 0 = bottom, 1 = upper
-+  int cell_tier = -1;
- };
- 
- // Return value for grid searches.
 diff --git a/src/dpl/src/infrastructure/network.cxx b/src/dpl/src/infrastructure/network.cxx
 index b4b2921e21..ffe3b5109e 100644
 --- a/src/dpl/src/infrastructure/network.cxx
@@ -14028,168 +13447,8 @@ index b4b2921e21..ffe3b5109e 100644
      Pin* ptr = addPin(iterm);
      connect(ptr, getNode(iterm->getInst()));
      connect(ptr, edge);
-diff --git a/src/grt/include/grt/GlobalRouter.h b/src/grt/include/grt/GlobalRouter.h
-index a25524a11c..d87fc1bc46 100644
---- a/src/grt/include/grt/GlobalRouter.h
-+++ b/src/grt/include/grt/GlobalRouter.h
-@@ -138,6 +138,10 @@ class GlobalRouter
-   void setMaxLayerForClock(int max_layer);
-   int getMinLayerForClock();
-   int getMaxLayerForClock();
-+  // Per-clock-subnet layer range override
-+  void setPerNetClockLayerRange(odb::dbNet* net, int min_layer, int max_layer);
-+  void clearPerNetClockLayerRanges();
-+  int getPerNetClockLayerRangeCount() const;
-   void setCriticalNetsPercentage(float critical_nets_percentage);
-   void addLayerAdjustment(int layer, float reduction_percentage);
-   void addRegionAdjustment(int min_x,
-@@ -531,6 +535,10 @@ class GlobalRouter
-   // Region adjustment variables
-   std::vector<RegionAdjustment> region_adjustments_;
- 
-+  // Per-clock-subnet layer range overrides (net -> min/max routing layer)
-+  // Maps clock net -> (min_layer, max_layer) for hold-aware routing
-+  std::unordered_map<odb::dbNet*, std::pair<int,int>> per_net_clock_layer_range_;
-+
-   bool verbose_;
- 
-   // variables for random grt
-diff --git a/src/grt/src/GlobalRouter.cpp b/src/grt/src/GlobalRouter.cpp
-index 8bb6a2b2f7..184cb69c23 100644
---- a/src/grt/src/GlobalRouter.cpp
-+++ b/src/grt/src/GlobalRouter.cpp
-@@ -1421,6 +1421,21 @@ void GlobalRouter::getNetLayerRange(odb::dbNet* db_net,
-                                     int& min_layer,
-                                     int& max_layer)
- {
-+  // A per-net clock layer range override takes precedence
-+  auto it = per_net_clock_layer_range_.find(db_net);
-+  if (it != per_net_clock_layer_range_.end()) {
-+    min_layer = it->second.first;
-+    max_layer = it->second.second;
-+    // Still respect pin connection layer minimum
-+    Net* net = db_net_map_[db_net];
-+    int pin_min_layer = std::numeric_limits<int>::max();
-+    for (const Pin& pin : net->getPins()) {
-+      pin_min_layer = std::min(pin_min_layer, pin.getConnectionLayer());
-+    }
-+    min_layer = std::max(min_layer, pin_min_layer);
-+    return;
-+  }
-+
-   Net* net = db_net_map_[db_net];
-   int pin_min_layer = std::numeric_limits<int>::max();
-   for (const Pin& pin : net->getPins()) {
-@@ -2048,6 +2063,23 @@ void GlobalRouter::setMaxLayerForClock(const int max_layer)
-   block_->setMaxLayerForClock(max_layer);
- }
- 
-+// Per-clock-subnet layer range override
-+void GlobalRouter::setPerNetClockLayerRange(odb::dbNet* net,
-+                                            int min_layer, int max_layer)
-+{
-+  per_net_clock_layer_range_[net] = {min_layer, max_layer};
-+}
-+
-+void GlobalRouter::clearPerNetClockLayerRanges()
-+{
-+  per_net_clock_layer_range_.clear();
-+}
-+
-+int GlobalRouter::getPerNetClockLayerRangeCount() const
-+{
-+  return static_cast<int>(per_net_clock_layer_range_.size());
-+}
-+
- void GlobalRouter::setCriticalNetsPercentage(float critical_nets_percentage)
- {
-   if (sta_->getDbNetwork()->defaultLibertyLibrary() == nullptr) {
-diff --git a/src/grt/src/GlobalRouter.i b/src/grt/src/GlobalRouter.i
-index f4ada4f1b6..fb479280e2 100644
---- a/src/grt/src/GlobalRouter.i
-+++ b/src/grt/src/GlobalRouter.i
-@@ -307,6 +307,32 @@ float estimate_path_resistance(odb::dbObject* pin1,
-     pin1, pin2, layer1, layer2, verbose);
- }
- 
-+// Per-clock-subnet layer range override
-+void
-+set_per_net_clock_layer_range(const char* net_name, int min_layer, int max_layer)
-+{
-+  auto* block = ord::OpenRoad::openRoad()->getDb()->getChip()->getBlock();
-+  auto* db_net = block->findNet(net_name);
-+  if (db_net == nullptr) {
-+    ord::OpenRoad::openRoad()->getLogger()->warn(
-+        utl::GRT, 350, "Net {} not found for per-net clock layer range.", net_name);
-+    return;
-+  }
-+  getGlobalRouter()->setPerNetClockLayerRange(db_net, min_layer, max_layer);
-+}
-+
-+void
-+clear_per_net_clock_layer_ranges()
-+{
-+  getGlobalRouter()->clearPerNetClockLayerRanges();
-+}
-+
-+int
-+get_per_net_clock_layer_range_count()
-+{
-+  return getGlobalRouter()->getPerNetClockLayerRangeCount();
-+}
-+
- } // namespace
- 
- %} // inline
-diff --git a/src/grt/src/GlobalRouter.tcl b/src/grt/src/GlobalRouter.tcl
-index 0adb35adb6..8b344e3500 100644
---- a/src/grt/src/GlobalRouter.tcl
-+++ b/src/grt/src/GlobalRouter.tcl
-@@ -645,3 +645,42 @@ proc have_detailed_route { block } {
- 
- # grt namespace end
- }
-+
-+# Per-clock-subnet layer range (layer range override of one clock net)
-+sta::define_cmd_args "set_clock_subnet_layers" {
-+  [-net net_name] [-min_layer layer_name] [-max_layer layer_name]
-+}
-+
-+proc set_clock_subnet_layers { args } {
-+  sta::parse_key_args "set_clock_subnet_layers" args \
-+    keys {-net -min_layer -max_layer} flags {}
-+
-+  sta::check_argc_eq0 "set_clock_subnet_layers" $args
-+
-+  if { ![info exists keys(-net)] } {
-+    utl::error GRT 351 "set_clock_subnet_layers requires -net argument."
-+  }
-+  if { ![info exists keys(-min_layer)] } {
-+    utl::error GRT 352 "set_clock_subnet_layers requires -min_layer argument."
-+  }
-+  if { ![info exists keys(-max_layer)] } {
-+    utl::error GRT 353 "set_clock_subnet_layers requires -max_layer argument."
-+  }
-+
-+  set net_name $keys(-net)
-+  set min_layer_name $keys(-min_layer)
-+  set max_layer_name $keys(-max_layer)
-+
-+  set min_idx [grt::parse_layer_name $min_layer_name]
-+  set max_idx [grt::parse_layer_name $max_layer_name]
-+
-+  grt::set_per_net_clock_layer_range $net_name $min_idx $max_idx
-+}
-+
-+# Clear all per-net clock layer range overrides
-+sta::define_cmd_args "clear_clock_subnet_layers" {}
-+
-+proc clear_clock_subnet_layers { args } {
-+  sta::check_argc_eq0 "clear_clock_subnet_layers" $args
-+  grt::clear_per_net_clock_layer_ranges
-+}
 diff --git a/src/gui/src/chartsWidget.cpp b/src/gui/src/chartsWidget.cpp
-index 533c48a5eb..c22333ddb9 100644
+index 533c48a5eb..b7ba9e2ca6 100644
 --- a/src/gui/src/chartsWidget.cpp
 +++ b/src/gui/src/chartsWidget.cpp
 @@ -99,7 +99,10 @@ void GuiChart::setXAxisFormat(const std::string& format)
@@ -14197,7 +13456,7 @@ index 533c48a5eb..c22333ddb9 100644
  void GuiChart::setYAxisFormats(const std::vector<std::string>& formats)
  {
 -  assert(formats.size() == series_.size());
-+  // Guard against a size mismatch instead of crashing
++  // Ignore a list whose size does not match the number of series
 +  if (formats.size() != series_.size()) {
 +    return;
 +  }
@@ -14209,7 +13468,7 @@ index 533c48a5eb..c22333ddb9 100644
  void GuiChart::setYAxisMin(const std::vector<std::optional<double>>& mins)
  {
 -  assert(mins.size() == series_.size());
-+  // Guard against a size mismatch instead of crashing
++  // Ignore a list whose size does not match the number of series
 +  if (mins.size() != series_.size()) {
 +    return;
 +  }
@@ -14280,10 +13539,10 @@ index b39edd4268..6e273cf825 100644
    /// Get the orientation of this instance.
    ///
 diff --git a/src/odb/src/db/dbBlock.cpp b/src/odb/src/db/dbBlock.cpp
-index 8215634c09..b1be873197 100644
+index 8215634c09..a0e01915c6 100644
 --- a/src/odb/src/db/dbBlock.cpp
 +++ b/src/odb/src/db/dbBlock.cpp
-@@ -3870,12 +3870,16 @@ std::string _dbBlock::makeNewName(
+@@ -3870,12 +3870,9 @@ std::string _dbBlock::makeNewName(
  
    // Decide hierarchical name without unique index
    fmt::memory_buffer buf;
@@ -14293,21 +13552,14 @@ index 8215634c09..b1be873197 100644
 -                   parent->getHierarchicalName(),
 -                   block->getHierarchyDelimiter());
 -  }
-+  // The hierarchical name prefix is not applied (ModInst pointers are not dereferenced here).
-+  // The parent pointer from top module's getModInst() can be invalid/garbage in flat designs
-+  // Flat netlists only: module instances are not resolved by this code.
-+  // if (parent) {
-+  //   fmt::format_to(std::back_inserter(buf),
-+  //                  "{}{}",
-+  //                  parent->getHierarchicalName(),
-+  //                  block->getHierarchyDelimiter());
-+  // }
++  // The hierarchical name prefix of the parent module instance is not applied
++  // and the parent is not dereferenced (flat netlists only).
 +  (void)parent;  // Suppress unused parameter warning
    buf.append(fmt::string_view(base_name));
    buf.push_back('\0');  // Null-terminate for find* functions
  
 diff --git a/src/odb/src/db/dbInst.cpp b/src/odb/src/db/dbInst.cpp
-index e03a67823b..ae3d6477ca 100644
+index e03a67823b..a82be5c1e7 100644
 --- a/src/odb/src/db/dbInst.cpp
 +++ b/src/odb/src/db/dbInst.cpp
 @@ -103,6 +103,7 @@ _dbInst::_dbInst(_dbDatabase*)
@@ -14372,15 +13624,12 @@ index e03a67823b..ae3d6477ca 100644
  void dbInst::setLocationOrient(dbOrientType orient)
  {
    int x, y;
-@@ -1396,8 +1416,13 @@ dbInst* dbInst::create(dbBlock* block,
+@@ -1396,8 +1416,10 @@ dbInst* dbInst::create(dbBlock* block,
                         const dbNameUniquifyType& uniquify,
                         dbModule* parent_module)
  {
-+  // The parent ModInst is not passed (ModInst pointers are not dereferenced here).
-+  // The crash occurs because getModInst() can return invalid pointers
-+  // for modules that don't have a proper parent ModInst set up.
-+  // This disables hierarchical naming prefixes but ensures stability.
-+  // Flat netlists only: module instances are not resolved by this code.
++  // The parent module instance is not passed and not dereferenced, so the
++  // name gets no hierarchical prefix (flat netlists only).
    std::string inst_name = block->makeNewInstName(
 -      parent_module ? parent_module->getModInst() : nullptr,
 +      nullptr,
@@ -14400,7 +13649,7 @@ index 25500dc098..057969ae6f 100644
    dbId<_dbInst> next_entry_;
    dbId<_dbInstHdr> inst_hdr_;
 diff --git a/src/odb/src/db/tmg_conn.cpp b/src/odb/src/db/tmg_conn.cpp
-index 98b94af99d..84554e2659 100644
+index 98b94af99d..b9ea8bbd70 100644
 --- a/src/odb/src/db/tmg_conn.cpp
 +++ b/src/odb/src/db/tmg_conn.cpp
 @@ -1124,13 +1124,17 @@ void tmg_conn::connectTerm(const int j, const bool soft)
@@ -14414,9 +13663,9 @@ index 98b94af99d..84554e2659 100644
 -                       net_->getName(),
 -                       pt->x,
 -                       pt->y);
-+        // DRT short: point already assigned to another terminal.
-+        // Skip this assignment to preserve existing RC tree topology.
-+        // The short is a DRT routing violation, not an ODB bug.
++        // Short: the point is already assigned to another terminal.  The
++        // assignment is skipped (the existing RC tree topology is kept) and
++        // the short is reported as a warning.
 +        logger_->warn(ODB,
 +                      390,
 +                      "order_wires: net {}, shorts to another term at "

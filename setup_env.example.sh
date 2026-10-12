@@ -5,14 +5,10 @@
 # OpenROAD binary with the 3D CTS changes (build: see README.md); every stage uses this one binary
 export CTS3D_OPENROAD=/path/to/OpenROAD/build/bin/openroad
 
-# runtime libraries of that binary (environment modules on our cluster; adjust or delete)
-command -v module >/dev/null 2>&1 || source /etc/profile.d/modules.sh 2>/dev/null
-if command -v module >/dev/null 2>&1; then
-  module load tcl/8.6.6 yaml-cpp/0.8.0 gcc/12.2.0 2>/dev/null || true
-fi
-# export LD_LIBRARY_PATH=/path/to/extra/libs:${LD_LIBRARY_PATH:-}
+# runtime libraries of that binary that are not on the default search path, for example
+# export LD_LIBRARY_PATH=/path/to/tcl/lib:/path/to/yaml-cpp/lib64:/path/to/gcc/lib64:${LD_LIBRARY_PATH:-}
 
-# thread budget of one case (stage G runs 16 extraction processes x 1 thread regardless)
+# thread budget of one case (graph extraction runs THREADS processes x 1 thread)
 export THREADS=${THREADS:-16}
 
 # Cadence Innovus (routing of ariane133 only; ./run_route.sh of the other designs needs no Cadence tool)

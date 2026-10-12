@@ -3,7 +3,7 @@
 #
 #   usage: ./run_route.sh <case> [-w <run_dir>]
 #          ./run_route.sh all [-j <lanes>]
-#     <case>     one of the cases of configs/cases.tsv; its checkpoint is <run_dir>/OUTPUT/4_cts.{def,sdc,v}
+#     <case>     one of the cases of flow/configs/cases.tsv; its checkpoint is <run_dir>/OUTPUT/4_cts.{def,sdc,v}
 #                (written by ./run_cts.sh <case>; default run_dir: runs/<case>)
 #     all        every case whose checkpoint exists, <lanes> cases at a time (default 1)
 #   env: THREADS (default 16); DETAILED_ROUTE_END_ITERATION overrides the detailed-routing iteration count of the
@@ -13,7 +13,7 @@
 #           <run_dir>/route/reports/<platform>/<design>/openroad/6_finish.rpt (summary printed at the end)
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-source "$ROOT/flow/common.sh"
+source "$ROOT/flow/cts/common.sh"
 [[ $# -ge 1 ]] || { sed -n '4,13p' "$0"; exit 2; }
 c=$1; shift; work=""; lanes=1
 while [[ $# -gt 0 ]]; do
@@ -34,7 +34,7 @@ ckpt=$work/OUTPUT
 for f in 4_cts.def 4_cts.sdc 4_cts.v; do
   [[ -s $ckpt/$f ]] || { echo "missing $ckpt/$f (run ./run_cts.sh $c first)" >&2; exit 2; }
 done
-set +u; source "$FLOW_HOME_DIR/env.sh"; source "$ROOT/configs/cts_params.env"; set -u
+set +u; source "$FLOW_HOME_DIR/env.sh"; source "$ROOT/flow/configs/cts_params.env"; set -u
 export OPENROAD_EXE=$CTS3D_OPENROAD NUM_CORES=${THREADS:-16} FLOW_VARIANT=openroad
 R=$work/route; res=$R/results/$PLATFORM/$DESIGN/openroad; rep=$R/reports/$PLATFORM/$DESIGN/openroad; sum=$work/route_summary.txt
 rm -rf "$R" "$sum"; mkdir -p "$res" "$rep" "$R/logs/$PLATFORM/$DESIGN/openroad" "$R/objects/$PLATFORM/$DESIGN/openroad"
@@ -49,7 +49,6 @@ if [[ $DESIGN == ariane133 ]]; then
   [[ -x $INNOVUS_EXE ]] || { echo "INNOVUS_EXE=$INNOVUS_EXE is not executable" >&2; exit 2; }
   echo "router=innovus ($INNOVUS_EXE)"
   mk cds-route   || fail cds-route
-  mk cds-restore || echo "warning: cds-restore (Innovus post-route report) failed; continuing with the OpenROAD report"
 else
   echo "router=openroad"
   mk ord-route || fail ord-route

@@ -1,0 +1,36 @@
+TaiWei-Pin-3D: https://github.com/CODA-Team/TaiWei-Pin-3D. Used in flow/platforms/asap7_3D, flow/platforms/asap7_nangate45_3D (two-tier platforms), flow/route/cadence/ (Innovus routing scripts, written by Zhiyu Zheng, Fudan University), flow/Makefile (derived), inputs/ (placements produced with the Pin-3D flow). Modifications: platform and design configurations reduced to the CTS and routing steps; Innovus script reduced to routing. License: BSD-3-Clause, CODA-Team.
+
+Cadence Innovus is not distributed. The Innovus scripts in flow/route/cadence/ carry this notice from their
+authors: "This script was written and developed by Zhiyu Zheng at Fudan University; however, the underlying commands
+and reports are copyrighted by Cadence. We thank Cadence for granting permission to share our research to help promote
+and foster the next generation of innovators."
+==============================================================================
+
+BSD 3-Clause License
+
+Copyright (c) 2026, CODA-Team
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

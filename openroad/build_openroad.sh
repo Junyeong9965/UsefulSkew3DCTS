@@ -44,10 +44,9 @@ done
 cmake -S "$SRC" -B "$SRC/build" "${cfg[@]}"
 cmake --build "$SRC/build" -j"$JOBS" --target openroad
 
-# ---- link fix for prebuilt OR-Tools: the configure lists every absl library of the OR-Tools package explicitly on the
-#      openroad link line; libortools.so already carries absl, and the duplicate static copies abort at start-up (absl
-#      ODR check).  Drop the explicit absl entries and relink once; RPATH_DIRS (deps.local.sh) are added as run paths so
-#      that the binary finds OR-Tools / spdlog without LD_LIBRARY_PATH.
+# ---- prebuilt OR-Tools: libortools.so contains absl, so the explicit absl libraries on the openroad link line are
+#      removed (duplicate copies fail the absl ODR check at start-up) and the binary is relinked once; RPATH_DIRS
+#      (deps.local.sh) are added as run paths for OR-Tools / spdlog.
 LT=$SRC/build/src/CMakeFiles/openroad.dir/link.txt
 if grep -qE 'libabsl[a-z0-9_]*\.(a|so)' "$LT"; then
   sed -i -E 's#[^ ]*libabsl[a-z0-9_]*\.a##g; s#[^ ]*libabsl[a-z0-9_]*\.so[.0-9]*##g; s#-labsl[a-z0-9_]*##g' "$LT"
