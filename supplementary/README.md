@@ -33,11 +33,27 @@ Data: [`data/post_cts_timing.csv`](data/post_cts_timing.csv).
 
 CTS wall time was measured on the same server for both flows in each benchmark case. The servers were equipped with
 two Intel Xeon Gold 6148 processors at 2.40 GHz, providing 40 physical cores and 80 hardware threads. Our flow was run
-with `THREADS=32` and required 3.3–6.6× the CTS runtime of Pin-3D. Pin-3D constructs a balanced clock tree with clock
+with `THREADS=32` and required 3.3–6.5× the CTS runtime of Pin-3D. Pin-3D constructs a balanced clock tree with clock
 buffers on one tier. Our flow additionally performs STA-based timing-graph extraction, LP scheduling, timing-driven
 early-clock construction, and STA-guided clock-tree refinement.
+The ratio is largest for AES, the smallest design: the additional steps have a fixed cost (OpenROAD session
+start-up and design loading) that is large relative to its short Pin-3D CTS time.
 
 <p align="center"><img src="../images/runtime_total.png" width="100%" alt="CTS runtime"></p>
+
+| Platform | Design | Pin-3D (s) | Ours (s) | Ours / Pin-3D |
+|---|---|--:|--:|--:|
+| A7/A7 | AES | 16.7 | 108.6 | 6.5× |
+| A7/A7 | IBEX | 32.5 | 176.8 | 5.4× |
+| A7/A7 | JPEG | 68.0 | 281.0 | 4.1× |
+| A7/A7 | SWERV | 146.3 | 485.6 | 3.3× |
+| A7/A7 | ARIANE | 228.7 | 1,190.2 | 5.2× |
+| A7/N45 | AES | 11.1 | 66.8 | 6.0× |
+| A7/N45 | IBEX | 27.0 | 112.3 | 4.2× |
+| A7/N45 | JPEG | 69.3 | 324.4 | 4.7× |
+| A7/N45 | SWERV | 145.1 | 499.8 | 3.4× |
+| A7/N45 | ARIANE | 237.4 | 1,282.4 | 5.4× |
+| Total | | 982.1 | 4,527.9 | 4.6× |
 
 Data: [`data/runtime.csv`](data/runtime.csv).
 
