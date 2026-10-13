@@ -40,6 +40,13 @@ else
 fi
 
 # ---- configure (optional dependency locations from setup_env.sh)
+# A Tcl environment module sets TCL_LIBRARY to the directory of the Tcl library; CMake needs the library file and header.
+if [[ -d ${TCL_LIBRARY:-} ]]; then
+  tcl_dir=${TCL_LIBRARY%/}
+  tcl_so=$(ls "$tcl_dir"/libtcl8*.so "$tcl_dir"/libtcl.so 2>/dev/null | head -1 || true)
+  [[ -n $tcl_so ]] && TCL_LIBRARY=$tcl_so || unset TCL_LIBRARY
+  [[ -n ${TCL_HEADER:-} || ! -f $tcl_dir/../include/tcl.h ]] || TCL_HEADER=$(realpath "$tcl_dir/../include/tcl.h")
+fi
 cfg=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DBUILD_GUI=${BUILD_GUI:-ON} -DENABLE_TESTS=OFF)
 if [[ -n ${CMAKE_PREFIX_PATH:-} ]]; then cfg+=(-DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"); fi
 for v in CMAKE_C_COMPILER CMAKE_CXX_COMPILER BISON_EXECUTABLE FLEX_EXECUTABLE FLEX_INCLUDE_DIR LEMON_DIR \

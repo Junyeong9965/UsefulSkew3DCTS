@@ -12,7 +12,12 @@ export THREADS=${THREADS:-16}
 # Cadence Innovus (routing of ariane133 only; ./run_route.sh of the other designs needs no Cadence tool)
 # export INNOVUS_EXE=/path/to/innovus
 
-# Dependencies installed outside the default search paths (used by openroad/build_openroad.sh), for example:
+# OpenROAD dependencies outside the default search paths (used by openroad/build_openroad.sh).
+# With environment modules, load them here, for example:
+# module load gcc cmake tcl yaml-cpp swig bison flex boost spdlog or-tools cudd lemon
+# Or give the install prefixes and the compiler:
 # export CMAKE_PREFIX_PATH=/path/to/or-tools:/path/to/spdlog:/path/to/yaml-cpp:/path/to/boost
 # export CMAKE_C_COMPILER=/path/to/gcc-12/bin/gcc CMAKE_CXX_COMPILER=/path/to/gcc-12/bin/c++
-# Other CMake locations can be set here when needed; see the header of openroad/build_openroad.sh.
+# A dependency that CMake still does not find can be set by its CMake variable, for example
+# export LEMON_DIR=/path/to/lemon/share/lemon/cmake
+# (the variables are listed in the header of openroad/build_openroad.sh).
