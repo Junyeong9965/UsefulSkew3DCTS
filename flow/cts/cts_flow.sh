@@ -47,18 +47,46 @@ phase() { say "$1..."; printf '%s\n' "$2" > "$PHASE"; }
 ( while sleep 60 > /dev/null 2>&1; do [[ -s $PHASE ]] && say "  $(cat "$PHASE") in progress... elapsed $(elapsed)"; done ) &
 HEARTBEAT=$!; disown $HEARTBEAT
 trap 'kill $HEARTBEAT 2> /dev/null' EXIT
-# step_start <step name>: the phases of the run start with these steps
+# step_messages <step dir>: the OpenROAD INFO / WARNING / ERROR messages of a step, in order, without the messages
+# that report timing (the run log gives the timing of the result only); a message ID that repeats is printed three
+# times and then counted
+# OpenROAD messages of one step: loader messages (LEF/DEF/Liberty) only in the first step, file names without
+# directories, at most three lines per message id (one for the repeated Liberty/thread notes)
+step_messages() { local f first=$2
+  [[ -d $1 ]] || return 0
+  f=$(find "$1" -name '*.log' -type f | sort)
+  [[ -n $f ]] || return 0
+  grep -hE '^\[(INFO|WARNING|ERROR) [A-Z]+-[0-9]+\]' $f | grep -viE 'early|hub' | grep -vE 'TNS|WNS|W\*|(setup|hold) -?[0-9]' |
+    sed -E 's#/[^ ,:]*/([^/ ,:]+)#\1#g' | awk -v first="$first" '
+    BEGIN { split("ODB-0127 ODB-0128 ODB-0134 ODB-0220 ODB-0227 ODB-0249 ODB-0252 ODB-0253 ODB-0254 ODB-0394 STA-1212 ORD-0030 CTS-0352 CTS-0359", a)
+            for (i in a) loader[a[i]] = 1
+            split("CTS-0357 CTS-0427 CTS-0880 CTS-0883 CTS-2131 CTS-2132", b); for (i in b) hide[b[i]] = 1
+            lim["STA-1212"] = 1; lim["ORD-0030"] = 1 }
+    { id = $2; sub(/\]$/, "", id)
+      if (id in hide || (!first && id in loader) || $0 == prev) next
+      prev = $0; m = (id in lim) ? lim[id] : 3
+      if (++n[id] <= m) print "  " $0; else if (!(id in seen)) { seen[id] = 1; order[++k] = id } }
+    END { for (i = 1; i <= k; i++) printf "  (%d more %s messages)\n", n[order[i]] - (order[i] in lim ? lim[order[i]] : 3), order[i] }'; }
 step_start() { case $1 in
     off_P) phase "Building initial clock tree" "Clock tree construction";;
     off_G) phase "Extracting timing graph" "Timing graph extraction";;
     off_D) phase "Computing initial delay targets" "Delay-target computation";;
-    DEC)   phase "Evaluating early-clock candidates" "Candidate evaluation";;
+    DEC)   if [[ -e $RUN/out/.d_done ]]; then phase "Evaluating early-clock candidates" "Candidate evaluation"
+           else touch "$RUN/out/.dec_pending"; fi;;
   esac; }
-# log_step <step name> <rc>: stop on a failed step; after the candidate evaluation (or after the delay targets when
-# early-clock construction is off) the rest of the run is the clock-tree optimization
-log_step() { local n=$1 rc=$2
+# log_step <step name> <rc>: stop on a failed step; print the messages of the initial-tree and delay-target steps;
+# once both the delay targets and the candidate evaluation are done (only the delay targets when early-clock
+# construction is off), the rest of the run is the clock-tree optimization
+log_step() { local n=$1 rc=$2 o=$RUN/out
   [[ $rc == 0 ]] || die "stage=$n rc=$rc"
-  if [[ $n == DEC || ( $n == off_D && ${CTS3D_EARLY_CLOCK:-1} != 1 ) ]]; then phase "Optimizing clock tree" "Optimization"; fi
+  case $n in
+    off_P) step_messages "$RUN/arms/off/P/logs" 1;;
+    off_D) step_messages "$RUN/arms/off/D/logs" ""; touch "$o/.d_done"
+           [[ ! -e $o/.dec_pending ]] || phase "Evaluating early-clock candidates" "Candidate evaluation"
+           if [[ -e $o/.dec_done || ${CTS3D_EARLY_CLOCK:-1} != 1 ]]; then phase "Optimizing clock tree" "Optimization"; fi;;
+    DEC)   touch "$o/.dec_done"
+           [[ ! -e $o/.d_done ]] || phase "Optimizing clock tree" "Optimization";;
+  esac
   return 0; }
 # st <name> <cmd...>: run and time one step; abort the run on failure
 st() { local n=$1; shift

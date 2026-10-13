@@ -28,10 +28,11 @@ if {$::env(CTS_STAGE) eq "phase1"} {
   set t0 [clock seconds]
   set cmd [list $::env(OPENROAD_EXE) -no_init -threads $::env(NUM_CORES) -exit $::env(OPENROAD_SCRIPTS_DIR)/phase1_tree.tcl]
   puts ">>> $cmd"
-  if {[catch {exec {*}$cmd} out]} {
+  # the child writes straight to this session's stdout (capturing it in Tcl re-encodes the text and garbles lines)
+  flush stdout
+  if {[catch {exec {*}$cmd >@ stdout 2>@ stderr} out]} {
     error "Phase 1 failed: $out"
   }
-  puts $out
   puts ">>> Phase 1 elapsed: [expr {[clock seconds] - $t0}]s"
   exit
 }
