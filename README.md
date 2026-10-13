@@ -17,8 +17,6 @@ The flow is implemented as a patch to OpenROAD and a set of flow scripts. Starti
 4. refines the tree with STA-guided buffer resizing, clock-path reconnection and buffer relocation (clock tree
    refinement).
 
-Method details: [`supplementary/method_details.md`](supplementary/method_details.md).
-
 ### Paper sections and source code
 
 The OpenROAD changes are in `openroad/openroad_3dcts.patch`. The files below are under `src/cts/src/` of the patched
@@ -84,9 +82,14 @@ If OpenROAD reports a missing shared library, add the directory containing that 
    ```
    ./run_route.sh a7a7_aes
    ```
-   Routing uses OpenROAD (10 detailed-routing iterations in `config.mk`; `DETAILED_ROUTE_END_ITERATION=<n>` overrides
-   it), except the two `ariane133` cases, which use Cadence Innovus. Extraction (OpenRCX) and the final report run in
-   OpenROAD. All cases: `./run_route.sh all -j <N>`.
+   Routing uses OpenROAD, except the two `ariane133` cases, which use Cadence Innovus. Extraction (OpenRCX) and the
+   final report run in OpenROAD. All cases: `./run_route.sh all -j <N>`.
+
+   `DETAILED_ROUTE_END_ITERATION` sets the number of detailed-routing iterations (default 0: initial detailed routing
+   only). More iterations reduce DRC violations at a longer runtime, for example:
+   ```
+   DETAILED_ROUTE_END_ITERATION=10 ./run_route.sh a7a7_aes
+   ```
 3. Check the results in `runs/a7a7_aes/`:
 
    | Directory | Content |
@@ -119,8 +122,7 @@ tier. Synthesis, tier partitioning and placement are not included: each case sta
 
 ## Supplementary material
 
-[`supplementary/`](supplementary/README.md): post-CTS timing, CTS runtime, realization of the scheduled delays and
-method details.
+[`supplementary/`](supplementary/README.md): post-CTS timing, CTS runtime and realization of the scheduled delays.
 
 ## Repository layout
 

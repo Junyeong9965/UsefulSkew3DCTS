@@ -6,7 +6,6 @@ in [Benchmarks](../README.md#benchmarks).
 - [Post-CTS timing](#post-cts-timing)
 - [CTS runtime](#cts-runtime)
 - [Realization of delay targets](#realization-of-delay-targets)
-- [Method details](method_details.md)
 
 ## Post-CTS Timing
 
