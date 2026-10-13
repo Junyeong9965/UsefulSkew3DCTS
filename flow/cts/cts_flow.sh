@@ -32,25 +32,37 @@ T0=$(date +%s.%N)
   echo "RUN binary=$CTS3D_OPENROAD sha256=$(sha256sum "$CTS3D_OPENROAD" | cut -c1-64)"; } > "$T"
 
 # ---------------------------------------------------------------------------------------------- run log
-# stdout is the run log: the initial-tree timing, the result and the total time.  Every step is timed in
-# tmp/out/times.txt; the OpenROAD console of every step goes to tmp/logs/.
+# stdout is the run log: one line when a phase of the run starts, a progress line every minute, and at the end the
+# timing of the output tree and the total wall time.  Every step is timed in tmp/out/times.txt; the OpenROAD console
+# of every step goes to tmp/logs/.
 elapsed() { local s=$(( $(date +%s) - ${T0%.*} )); printf '%02d:%02d:%02d' $((s/3600)) $((s%3600/60)) $((s%60)); }
 say() { printf '%s\n' "$*"; }
 # die <record>: record a failure in the step times and stop (the intermediate data is kept)
-die() { echo "FAILED $*" >> "$T"; say "FAILED (step logs and intermediate data kept in $RUN)"; exit 1; }
+die() { echo "FAILED $*" >> "$T"; say "ERROR: CTS failed after $(elapsed); step logs and intermediate data are in $RUN"; exit 1; }
 K_G=$(( THREADS > 1 ? THREADS : 2 ))   # graph-extraction processes (cts_stage.sh)
-# fmt_metrics <metrics.csv>: setup/hold TNS/WNS of a metrics file (ps)
-fmt_metrics() { [[ -s $1 ]] || return 0
-  tail -1 "$1" | awk -F, '{printf "setup TNS %.1f WNS %.2f | hold TNS %.1f WNS %.2f ps", $1, $2, $3, $4}'; }
-# log_step <step name> <rc>: the run log reports only the initial tree (after its timing analysis) and failures
+# phase <title> <progress noun>: announce a phase of the run; the progress line names the latest phase
+PHASE=$RUN/out/phase
+phase() { say "$1..."; printf '%s\n' "$2" > "$PHASE"; }
+# progress line every minute until the run ends (stopped at the end and by the EXIT trap)
+( while sleep 60 > /dev/null 2>&1; do [[ -s $PHASE ]] && say "  $(cat "$PHASE") in progress... elapsed $(elapsed)"; done ) &
+HEARTBEAT=$!; disown $HEARTBEAT
+trap 'kill $HEARTBEAT 2> /dev/null' EXIT
+# step_start <step name>: the phases of the run start with these steps
+step_start() { case $1 in
+    off_P) phase "Building initial clock tree" "Clock tree construction";;
+    off_G) phase "Extracting timing graph" "Timing graph extraction";;
+    off_D) phase "Computing initial delay targets" "Delay-target computation";;
+    DEC)   phase "Evaluating early-clock candidates" "Candidate evaluation";;
+  esac; }
+# log_step <step name> <rc>: stop on a failed step; after the candidate evaluation (or after the delay targets when
+# early-clock construction is off) the rest of the run is the clock-tree optimization
 log_step() { local n=$1 rc=$2
   [[ $rc == 0 ]] || die "stage=$n rc=$rc"
-  if [[ $n == off_G ]]; then
-    say "initial 3D clock tree     $(fmt_metrics "$RUN/arms/off/G/reports/metrics.csv")"
-    say "useful-skew scheduling, clock construction and refinement ..."
-  fi; }
+  if [[ $n == DEC || ( $n == off_D && ${CTS3D_EARLY_CLOCK:-1} != 1 ) ]]; then phase "Optimizing clock tree" "Optimization"; fi
+  return 0; }
 # st <name> <cmd...>: run and time one step; abort the run on failure
 st() { local n=$1; shift
+  step_start "$n"
   /usr/bin/time -f "$n wall_s=%e user_s=%U sys_s=%S peak_kb=%M" -a -o "$T" "$@" >> "$RUN/logs/stages.log" 2>&1; local rc=$?
   echo "$n rc=$rc load_end=[$(cut -d' ' -f1-3 /proc/loadavg)]" >> "$T"
   log_step "$n" $rc; }
@@ -77,8 +89,7 @@ prep_native() { local dir=$1 prep=$2 o=$3 tag=$4
 
 say "3D CTS  case $c  ($plat / $des, clock period ${src##*/T} ps)"
 say "        host $(hostname -s), threads $THREADS"
-say "        placement $src"
-say "        OpenROAD $CTS3D_OPENROAD"
+say ""
 
 # ---------------------------------------------------------------------------------------------- OFF chain
 # ---------------------------------------------------------------------------------------------- OFF refinement
@@ -249,13 +260,22 @@ echo "END case=$c end_to_end_wall_s=$(echo "$(date +%s.%N) - $T0" | bc) date=$(d
 "$NATIVE/cts_select" report "$RUN" "$c" "$out_arm" "$arm_dir" "$why" "${oplan:-}" > /dev/null || die "stage=REPORT"
 mkdir -p "$W/results" "$W/reports"
 for f in 4_cts.odb 4_cts.def 4_cts.v 4_cts.sdc; do cp -L "$arm_dir/final/$f" "$W/results/$f"; done
-res=$(fmt_metrics "$arm_dir/final/metrics.csv")
-tail -1 "$arm_dir/final/metrics.csv" | awk -F, -v c="$c" -v p="$plat" -v d="$des" -v t="${src##*/T}" '{
-  printf "CTS result of %s (%s / %s, clock period %s ps)\n", c, p, d, t
-  printf "STA of results/4_cts.odb with placement parasitics and propagated clocks (ps)\n\n"
-  printf "%-8s %14s %12s\n", "", "TNS", "WNS"
-  printf "%-8s %14.1f %12.2f\n", "setup", $1, $2
-  printf "%-8s %14.1f %12.2f\n", "hold", $3, $4 }' > "$W/reports/4_cts_timing.rpt"
+# timing of the output tree (ps, placement parasitics)
+summary=$(tail -1 "$arm_dir/final/metrics.csv" | awk -F, '{
+  printf "%-8s %12s %11s %11s %10s\n", "", "Setup TNS", "Setup WNS", "Hold TNS", "Hold WNS"
+  printf "%-8s %12.1f %11.2f %11.1f %10.2f\n", "Final", $1, $2, $3, $4 }')
+{ say "CTS result of $c ($plat / $des, clock period ${src##*/T} ps)"
+  say "STA of results/4_cts.odb with placement parasitics and propagated clocks"
+  say ""
+  say "Timing summary (ps)"
+  say "$summary"; } > "$W/reports/4_cts_timing.rpt"
 [[ ${CTS3D_KEEP_INTERMEDIATES:-0} == 1 ]] || rm -rf "$RUN"
-say "CTS result                $res"
-say "results $W/results   total $(elapsed) (h:m:s)"
+kill $HEARTBEAT 2> /dev/null
+say ""
+say "CTS completed."
+say ""
+say "Timing summary (ps)"
+say "$summary"
+say ""
+say "Results: $W/results/"
+say "Total wall time: $(elapsed)"

@@ -30,7 +30,7 @@ if [[ $c == all ]]; then
   run_lane() { local i; for ((i = $1; i < ${#cases[@]}; i += lanes)); do "$ROOT/run_cts.sh" "${cases[i]}"; done; }
   for ((l = 0; l < lanes; l++)); do run_lane $l > "$ROOT/runs/run_all_lane$l.log" 2>&1 & done
   wait
-  for x in "${cases[@]}"; do printf '%-14s %s\n' "$x" "$(grep -E '^(CTS result|FAILED)' "$ROOT/runs/$x/logs/4_cts.log" 2>/dev/null | tail -1)"; done
+  for x in "${cases[@]}"; do printf '%-14s %s\n' "$x" "$(grep -E '^(Final|ERROR)' "$ROOT/runs/$x/logs/4_cts.log" 2>/dev/null | tail -1)"; done
   exit 0
 fi
 case_info "$c" || exit 2
