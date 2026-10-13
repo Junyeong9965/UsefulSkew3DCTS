@@ -17,6 +17,6 @@ export ADDITIONAL_LEFS_BOTTOM_COVER = $(sort $(wildcard $(PLATFORM_DIR)/lef_bott
 export ADDITIONAL_LIBS = $(sort $(wildcard $(PLATFORM_DIR)/lib_bottom/NLDM/fakeram/*.lib)) \
                          $(sort $(wildcard $(PLATFORM_DIR)/lib_upper/NLDM/fakeram/*.lib))
 
-export DETAILED_ROUTE_END_ITERATION = 10
+export DETAILED_ROUTE_END_ITERATION = 0
 
 export GLOBAL_ROUTE_ARGS = -verbose -congestion_iterations 30

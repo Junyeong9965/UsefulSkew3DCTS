@@ -6,15 +6,16 @@
 #     <case>     one of the cases of flow/configs/cases.tsv; its CTS result is <run_dir>/results/4_cts.{def,sdc,v}
 #                (written by ./run_cts.sh <case>; default run_dir: runs/<case>)
 #     all        every case whose checkpoint exists, <lanes> cases at a time (default 1)
-#   env: THREADS (default 16); DETAILED_ROUTE_END_ITERATION overrides the detailed-routing iteration count of the
-#        design configuration (10) for quick checks.  ariane133 is routed with Cadence Innovus (INNOVUS_EXE in setup_env.sh, else innovus from PATH); the other
-#        designs with OpenROAD.  Extraction (OpenRCX) and the final timing report always run in OpenROAD.
+#   env: THREADS (default 16); DETAILED_ROUTE_END_ITERATION sets the detailed-routing iteration count (default 0:
+#        initial detailed routing only; more iterations reduce DRC violations).  ariane133 is routed with Cadence
+#        Innovus (INNOVUS_EXE in setup_env.sh, else innovus from PATH), the other designs with OpenROAD.  Extraction
+#        (OpenRCX) and the final timing report always run in OpenROAD.
 #   output: <run_dir>/results/{5_route,6_final}.*, <run_dir>/reports/6_finish.rpt (summary printed at the end) and the
 #           step logs in <run_dir>/logs/
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$ROOT/flow/cts/common.sh"
-[[ $# -ge 1 ]] || { sed -n '4,13p' "$0"; exit 2; }
+[[ $# -ge 1 ]] || { sed -n '4,14p' "$0"; exit 2; }
 c=$1; shift; work=""; lanes=1
 while [[ $# -gt 0 ]]; do
   case $1 in -w) work=$2; shift 2;; -j) lanes=$2; shift 2;; *) echo "unknown option $1" >&2; exit 2;; esac
