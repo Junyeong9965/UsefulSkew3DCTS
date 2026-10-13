@@ -9,15 +9,20 @@
 # 3. prints the path of the binary; set CTS3D_OPENROAD in setup_env.sh to it.
 #
 # Dependencies are the upstream OpenROAD dependencies (OR-Tools, spdlog, Boost, yaml-cpp, Tcl, SWIG, Bison, Flex, lemon,
-# CUDD; see the upstream DependencyInstaller).  When they are not on the default search paths, put their locations into
-# openroad/deps.local.sh (not tracked; see deps.example.sh); this script sources it when it exists.
+# CUDD; see the upstream DependencyInstaller).  This script sources setup_env.sh when it exists; for dependencies outside
+# the default search paths, set there (only as needed):
+#   CMAKE_PREFIX_PATH, CMAKE_C_COMPILER, CMAKE_CXX_COMPILER      install prefixes and compiler
+#   BISON_EXECUTABLE FLEX_EXECUTABLE FLEX_INCLUDE_DIR SWIG_EXECUTABLE LEMON_DIR LEMON_INCLUDE_DIR LEMON_LIBRARY
+#   CUDD_HEADER CUDD_LIB spdlog_DIR Boost_DIR TCL_LIBRARY TCL_HEADER   individual CMake locations
+#   RPATH_DIRS                                                   extra run-path directories of the binary
+# Compiler and library search variables (CPLUS_INCLUDE_PATH, LIBRARY_PATH, LD_LIBRARY_PATH) are used as exported.
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BASE_COMMIT=0609245cc439dfaa667571b5ca386a6a265c0146          # upstream OpenROAD master (January 2026)
 UPSTREAM=${UPSTREAM:-https://github.com/The-OpenROAD-Project/OpenROAD.git}
 SRC=$(realpath -m "${1:-OpenROAD-3dcts}")
 JOBS=${JOBS:-40}
-if [[ -f $HERE/deps.local.sh ]]; then source "$HERE/deps.local.sh"; fi
+if [[ -f $HERE/../setup_env.sh ]]; then source "$HERE/../setup_env.sh"; fi
 
 # ---- source: upstream base commit + patch
 if [[ ! -d $SRC ]]; then
@@ -34,7 +39,7 @@ else
   echo "error: openroad_3dcts.patch does not apply to $SRC" >&2; exit 1
 fi
 
-# ---- configure (optional dependency locations from deps.local.sh)
+# ---- configure (optional dependency locations from setup_env.sh)
 cfg=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DBUILD_GUI=${BUILD_GUI:-ON} -DENABLE_TESTS=OFF)
 if [[ -n ${CMAKE_PREFIX_PATH:-} ]]; then cfg+=(-DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"); fi
 for v in CMAKE_C_COMPILER CMAKE_CXX_COMPILER BISON_EXECUTABLE FLEX_EXECUTABLE FLEX_INCLUDE_DIR LEMON_DIR \
@@ -49,7 +54,7 @@ cmake --build "$SRC/build" -j"$JOBS" --target openroad
 #       removed (duplicate copies fail the absl ODR check at start-up);
 #   (2) run paths: the directory of every shared library the binary resolves on this server outside the system
 #       directories (ldd in the build environment, plus TCL_LIBRARY of the CMake cache and RPATH_DIRS of
-#       deps.local.sh) is recorded in the binary, so it runs without LD_LIBRARY_PATH on the server where it was built.
+#       setup_env.sh) is recorded in the binary, so it runs without LD_LIBRARY_PATH on the server where it was built.
 BIN=$SRC/build/bin/openroad
 LT=$SRC/build/src/CMakeFiles/openroad.dir/link.txt
 before=$(cksum < "$LT")

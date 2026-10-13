@@ -4,11 +4,10 @@
 # cts_partitions must use the same libstdc++ hashing as the OpenROAD binary (gcc 12), because it
 # reproduces the iteration order of the extractor's std::unordered_map.  The tools link libstdc++ statically.
 #   usage: flow/cts/native/build.sh [c++ compiler]
-#   default compiler: $CXX, else CMAKE_CXX_COMPILER of openroad/deps.local.sh (the OpenROAD compiler), else g++
+#   default compiler: $CXX, else CMAKE_CXX_COMPILER of setup_env.sh (the OpenROAD compiler), else g++
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 [[ -f $ROOT/setup_env.sh ]] && source "$ROOT/setup_env.sh"
-[[ -f $ROOT/openroad/deps.local.sh ]] && source "$ROOT/openroad/deps.local.sh"
 CXX=${1:-${CXX:-${CMAKE_CXX_COMPILER:-g++}}}
 # warn if the compiler version differs from the newest GCC version recorded in the OpenROAD binary
 if [[ -n ${CTS3D_OPENROAD:-} && -f $CTS3D_OPENROAD ]] && command -v readelf > /dev/null; then

@@ -30,7 +30,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 This license covers the files of this repository that were written for it
 (flow/cts/, flow/configs/, run_cts.sh, run_route.sh, setup_env.example.sh,
-openroad/build_openroad.sh, openroad/deps.example.sh, flow/env.sh, the added
+openroad/build_openroad.sh, flow/env.sh, the added
 code in openroad/openroad_3dcts.patch, and the documentation). Third-party
 material redistributed in modified form keeps its own license, given in the
 LICENSE.* files next to it (openroad/, flow/, flow/platforms/, inputs/).
