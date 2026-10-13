@@ -36,8 +36,6 @@ two Intel Xeon Gold 6148 processors at 2.40 GHz, providing 40 physical cores and
 with `THREADS=32` and required 3.3–6.5× the CTS runtime of Pin-3D. Pin-3D constructs a balanced clock tree with clock
 buffers on one tier. Our flow additionally performs STA-based timing-graph extraction, LP scheduling, timing-driven
 early-clock construction, and STA-guided clock-tree refinement.
-The ratio is largest for AES, the smallest design: the additional steps have a fixed cost (OpenROAD session
-start-up and design loading) that is large relative to its short Pin-3D CTS time.
 
 <p align="center"><img src="../images/runtime_total.png" width="100%" alt="CTS runtime"></p>
 
