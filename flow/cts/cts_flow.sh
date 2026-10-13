@@ -296,7 +296,14 @@ summary=$(tail -1 "$arm_dir/final/metrics.csv" | awk -F, '{
   say "STA of results/4_cts.odb with placement parasitics and propagated clocks"
   say ""
   say "Timing summary (ps)"
-  say "$summary"; } > "$W/reports/4_cts_timing.rpt"
+  say "$summary"
+  say ""; } > "$W/reports/4_cts_timing.rpt"
+# worst setup / hold paths of results/4_cts.odb (same reload as the metrics, times in ps)
+phase "Writing timing report" "Timing report"
+REPORT_PATH_COUNT=${CTS3D_REPORT_PATHS:-5} bash "$CTS_DIR/openroad_run.sh" "$RUN/report" "$plat" "$des" \
+  "$W/results/4_cts.odb" "$W/results/4_cts.sdc" "$CTS_DIR/tcl/timing_report.tcl" "$(( THREADS < 8 ? THREADS : 8 ))" \
+  || die "stage=TIMING_REPORT"
+cat "$RUN/report/reports/paths.rpt" >> "$W/reports/4_cts_timing.rpt"
 [[ ${CTS3D_KEEP_INTERMEDIATES:-0} == 1 ]] || rm -rf "$RUN"
 kill $HEARTBEAT 2> /dev/null
 say ""

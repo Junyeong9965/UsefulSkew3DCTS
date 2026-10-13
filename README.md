@@ -93,7 +93,7 @@ If OpenROAD reports a missing shared library, add the directory containing that 
    |---|---|
    | `logs/` | CTS run log `4_cts.log` and the routing and final-report logs |
    | `results/` | CTS result `4_cts.{odb,def,v,sdc}` and the routed design (`5_route.*`, `6_final.*`) |
-   | `reports/` | `4_cts_timing.rpt` (setup/hold TNS and WNS after CTS) and `6_finish.rpt` (post-route timing, power, area and wire length) |
+   | `reports/` | `4_cts_timing.rpt` (setup/hold TNS and WNS after CTS, worst setup and hold paths) and `6_finish.rpt` (post-route timing, power, area and wire length) |
 
 ## Benchmarks
 
