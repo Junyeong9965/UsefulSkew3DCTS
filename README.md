@@ -34,7 +34,8 @@ OpenROAD tree.
 
 ## Requirements
 
-Linux x86-64 with the dependencies of upstream OpenROAD (see its `etc/DependencyInstaller.sh`). Versions tested:
+Linux x86-64 with the dependencies of [OpenROAD](https://github.com/The-OpenROAD-Project/OpenROAD), which its
+`etc/DependencyInstaller.sh` installs.
 
 | Tool / library | Version |
 |---|---|
@@ -46,21 +47,29 @@ Linux x86-64 with the dependencies of upstream OpenROAD (see its `etc/Dependency
 
 ## Build
 
-1. Install the dependencies (see Requirements).
-2. Create the site configuration. If a dependency is outside the default search paths, or a different version or
-   compiler must be used, set it in `setup_env.sh` (`CMAKE_PREFIX_PATH` and the compiler; other CMake locations are
-   listed in the header of `openroad/build_openroad.sh`).
-   ```
+1. Install the dependencies listed in Requirements.
+
+2. Create your configuration file:
+   ```bash
    cp setup_env.example.sh setup_env.sh
    ```
-3. Build OpenROAD (upstream commit 0609245c with `openroad/openroad_3dcts.patch`), set `CTS3D_OPENROAD` in
-   `setup_env.sh` to the printed binary (and `INNOVUS_EXE` for `ariane133`), and build the helper programs of the flow.
-   ```
+   If needed, edit the dependency paths and compiler settings in `setup_env.sh`.
+
+3. Build the patched OpenROAD:
+   ```bash
    openroad/build_openroad.sh ../OpenROAD-3dcts
+   ```
+   The script uses upstream commit `0609245c` and applies `openroad/openroad_3dcts.patch`.
+
+4. Set `CTS3D_OPENROAD` in `setup_env.sh` to the binary path printed by the build script, then build the helper
+   programs:
+   ```bash
    flow/cts/native/build.sh
    ```
-   If OpenROAD reports a missing shared library (for example `libtcl.so`), add its directory to `LD_LIBRARY_PATH` in
-   `setup_env.sh`.
+   To route `ariane133`, also set `INNOVUS_EXE`.
+
+If OpenROAD reports a missing shared library, add the directory containing that library to `LD_LIBRARY_PATH` in
+`setup_env.sh`.
 
 ## Running
 

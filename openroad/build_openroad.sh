@@ -59,14 +59,22 @@ BIN=$SRC/build/bin/openroad
 LT=$SRC/build/src/CMakeFiles/openroad.dir/link.txt
 before=$(cksum < "$LT")
 sed -i -E 's#[^ ]*libabsl[a-z0-9_]*\.a##g; s#[^ ]*libabsl[a-z0-9_]*\.so[.0-9]*##g; s#-labsl[a-z0-9_]*##g' "$LT"
+#   The run paths are searched in this order: the C++ runtime of the compiler, RPATH_DIRS, TCL_LIBRARY, then the
+#   directories ldd reports (so an older libstdc++ on LD_LIBRARY_PATH at build time is not taken first).
 dirs=()
-add_dir() { case $1 in ''|/lib|/lib64|/usr/lib|/usr/lib64) return;; esac; [[ " ${dirs[*]} " == *" $1 "* ]] || dirs+=("$1"); }
+add_dir() { case $1 in ''|.|/lib|/lib64|/usr/lib|/usr/lib64) return;; esac; [[ " ${dirs[*]} " == *" $1 "* ]] || dirs+=("$1"); }
+cxx=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$SRC/build/CMakeCache.txt")
+stdcxx=$("${cxx:-c++}" -print-file-name=libstdc++.so 2>/dev/null || true)
+[[ $stdcxx == /* ]] && add_dir "$(dirname "$(realpath "$stdcxx")")"
 for d in ${RPATH_DIRS:-}; do add_dir "$d"; done
 tcl=$(sed -n 's/^TCL_LIBRARY:[A-Z]*=//p' "$SRC/build/CMakeCache.txt")
 [[ $tcl == *.so* ]] && add_dir "$(dirname "$tcl")"
 while read -r lib; do add_dir "$(dirname "$lib")"; done < <(ldd "$BIN" 2>/dev/null | sed -n 's#^.* => \(/[^ ]*\) .*#\1#p')
-for d in "${dirs[@]}"; do grep -q -- "-rpath,$d " "$LT" || sed -i "s#-rdynamic #-rdynamic -Wl,-rpath,$d #" "$LT"; done
+rp=""; for d in "${dirs[@]}"; do rp+="-Wl,-rpath,$d "; done
+sed -i -E 's#-Wl,-rpath,[^ ]* ##g' "$LT"
+sed -i "s#-rdynamic #-rdynamic $rp#" "$LT"
 if [[ $(cksum < "$LT") != "$before" ]]; then ( cd "$SRC/build/src" && eval "$(cat CMakeFiles/openroad.dir/link.txt)" ); fi
+"$BIN" -version > /dev/null 2>&1 || { echo "error: $BIN does not start; check the libraries it resolves (ldd $BIN)" >&2; exit 1; }
 missing=$(env -u LD_LIBRARY_PATH ldd "$BIN" 2>/dev/null | sed -n 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' | tr '\n' ' ')
 [[ -z $missing ]] || echo "warning: not found without LD_LIBRARY_PATH: $missing(add their directories to LD_LIBRARY_PATH in setup_env.sh)" >&2
 echo "binary: $BIN"
