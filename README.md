@@ -84,12 +84,6 @@ If OpenROAD reports a missing shared library, add the directory containing that 
    ```
    Routing uses OpenROAD, except the two `ariane133` cases, which use Cadence Innovus. Extraction (OpenRCX) and the
    final report run in OpenROAD. All cases: `./run_route.sh all -j <N>`.
-
-   `DETAILED_ROUTE_END_ITERATION` sets the number of detailed-routing iterations (default 0: initial detailed routing
-   only). More iterations reduce DRC violations at a longer runtime, for example:
-   ```
-   DETAILED_ROUTE_END_ITERATION=10 ./run_route.sh a7a7_aes
-   ```
 3. Check the results in `runs/a7a7_aes/`:
 
    | Directory | Content |
