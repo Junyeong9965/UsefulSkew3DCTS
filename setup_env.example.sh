@@ -9,7 +9,8 @@ export CTS3D_OPENROAD=/path/to/OpenROAD-3dcts/build/bin/openroad
 # thread budget of one case (graph extraction runs THREADS processes x 1 thread)
 export THREADS=${THREADS:-16}
 
-# Cadence Innovus (routing of ariane133 only; ./run_route.sh of the other designs needs no Cadence tool)
+# Cadence Innovus (routing of ariane133 only; ./run_route.sh of the other designs needs no Cadence tool).
+# Used from PATH when INNOVUS_EXE is not set.
 # export INNOVUS_EXE=/path/to/innovus
 
 # OpenROAD dependencies outside the default search paths (used by openroad/build_openroad.sh).

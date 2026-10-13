@@ -7,7 +7,7 @@
 #                (written by ./run_cts.sh <case>; default run_dir: runs/<case>)
 #     all        every case whose checkpoint exists, <lanes> cases at a time (default 1)
 #   env: THREADS (default 16); DETAILED_ROUTE_END_ITERATION overrides the detailed-routing iteration count of the
-#        design configuration (10) for quick checks.  ariane133 is routed with Cadence Innovus (INNOVUS_EXE in setup_env.sh); the other
+#        design configuration (10) for quick checks.  ariane133 is routed with Cadence Innovus (INNOVUS_EXE in setup_env.sh, else innovus from PATH); the other
 #        designs with OpenROAD.  Extraction (OpenRCX) and the final timing report always run in OpenROAD.
 #   output: <run_dir>/results/{5_route,6_final}.*, <run_dir>/reports/6_finish.rpt (summary printed at the end) and the
 #           step logs in <run_dir>/logs/
@@ -39,19 +39,21 @@ done
 set +u; source "$FLOW_HOME_DIR/env.sh"; source "$ROOT/flow/configs/cts_params.env"; set -u
 export OPENROAD_EXE=$CTS3D_OPENROAD NUM_CORES=${THREADS:-16} FLOW_VARIANT=openroad
 exec 9< "$work"; flock -n 9 || { echo "$work is in use by another run" >&2; exit 2; }
-# the route runs in <run_dir>/tmp/route (deleted after a successful run); the 5_*/6_* files are then moved to
-# <run_dir>/{results,reports,logs}
+# the route runs in <run_dir>/tmp/route (deleted after a successful run) and its results and reports are then moved
+# to <run_dir>/{results,reports}; the step logs are written to <run_dir>/logs from the start
 R=$work/tmp/route; res=$R/results/$PLATFORM/$DESIGN/openroad; rep=$R/reports/$PLATFORM/$DESIGN/openroad
 rm -rf "$R"; rm -f "$work"/results/[56]_* "$work"/results/route.guide "$work"/results/updated_clks.sdc "$work"/reports/[56]_* "$work"/reports/final_* "$work"/reports/drt_* "$work"/logs/[56]_* "$work"/logs/cadence_*
-mkdir -p "$res" "$rep" "$R/logs/$PLATFORM/$DESIGN/openroad" "$R/objects/$PLATFORM/$DESIGN/openroad"
+mkdir -p "$res" "$rep" "$work/logs" "$R/objects/$PLATFORM/$DESIGN/openroad"
 cp "$ckpt"/4_cts.def "$ckpt"/4_cts.sdc "$ckpt"/4_cts.v "$res/"
 cfg=designs/$PLATFORM/$DESIGN/config.mk
-mk() { make -C "$FLOW_HOME_DIR" --no-print-directory DESIGN_CONFIG=$cfg WORK_HOME="$R" \
+mk() { make -C "$FLOW_HOME_DIR" --no-print-directory DESIGN_CONFIG=$cfg WORK_HOME="$R" LOG_DIR="$work/logs" \
          ${DETAILED_ROUTE_END_ITERATION:+DETAILED_ROUTE_END_ITERATION=$DETAILED_ROUTE_END_ITERATION} "$@"; }
-fail() { echo "FAILED $1 (logs kept in $R/logs)"; exit 1; }
+fail() { echo "FAILED $1 (logs in $work/logs, intermediate files in $R)"; exit 1; }
 echo "case=$c platform=$PLATFORM design=$DESIGN checkpoint=$ckpt threads=$NUM_CORES"
 if [[ $DESIGN == ariane133 ]]; then
-  : "${INNOVUS_EXE:?INNOVUS_EXE is not set (setup_env.sh): ariane133 is routed with Cadence Innovus}"
+  # INNOVUS_EXE of setup_env.sh if set, otherwise innovus from PATH
+  export INNOVUS_EXE=${INNOVUS_EXE:-$(command -v innovus 2> /dev/null)}
+  [[ -n $INNOVUS_EXE ]] || { echo "Cadence Innovus not found: ariane133 is routed with Innovus; set INNOVUS_EXE in setup_env.sh or add innovus to PATH" >&2; exit 2; }
   [[ -x $INNOVUS_EXE ]] || { echo "INNOVUS_EXE=$INNOVUS_EXE is not executable" >&2; exit 2; }
   echo "router=innovus ($INNOVUS_EXE)"
   mk cds-route   || fail cds-route
@@ -61,9 +63,8 @@ else
 fi
 mk ord-final || fail ord-final
 [[ -s $rep/6_finish.rpt ]] || fail "ord-final: 6_finish.rpt was not written"
-log=$R/logs/$PLATFORM/$DESIGN/openroad
 mv_out() { local f; for f in "$1"/*; do [[ -e $f && ${f##*/} != 4_cts.* ]] || continue; cp -rL "$f" "$2/" && rm -rf "$f"; done; }
-mv_out "$res" "$work/results"; mv_out "$rep" "$work/reports"; mv_out "$log" "$work/logs"
+mv_out "$res" "$work/results"; mv_out "$rep" "$work/reports"
 rm -rf "$R"; rmdir "$work/tmp" 2>/dev/null
 rpt=$work/reports/6_finish.rpt; log=$work/logs
 { echo "report: $rpt"

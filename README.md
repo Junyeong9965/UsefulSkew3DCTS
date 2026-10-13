@@ -66,7 +66,7 @@ Linux x86-64 with the dependencies of [OpenROAD](https://github.com/The-OpenROAD
    ```bash
    flow/cts/native/build.sh
    ```
-   To route `ariane133`, also set `INNOVUS_EXE`.
+   To route `ariane133`, put `innovus` in `PATH` or set `INNOVUS_EXE`.
 
 If OpenROAD reports a missing shared library, add the directory containing that library to `LD_LIBRARY_PATH` in
 `setup_env.sh`.
