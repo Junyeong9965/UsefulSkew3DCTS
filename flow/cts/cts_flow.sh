@@ -43,8 +43,9 @@ K_G=$(( THREADS > 1 ? THREADS : 2 ))   # graph-extraction processes (cts_stage.s
 # phase <title> <progress noun>: announce a phase of the run; the progress line names the latest phase
 PHASE=$RUN/out/phase
 phase() { say "$1..."; printf '%s\n' "$2" > "$PHASE"; }
-# progress line every minute until the run ends (stopped at the end and by the EXIT trap)
-( while sleep 60 > /dev/null 2>&1; do [[ -s $PHASE ]] && say "  $(cat "$PHASE") in progress... elapsed $(elapsed)"; done ) &
+# progress line every minute until the run ends (stopped at the end and by the EXIT trap); started without fd 9 (the run
+# directory lock of run_cts.sh) so that a pending sleep does not keep the run directory locked after the run
+( while sleep 60 > /dev/null 2>&1; do [[ -s $PHASE ]] && say "  $(cat "$PHASE") in progress... elapsed $(elapsed)"; done ) 9<&- &
 HEARTBEAT=$!; disown $HEARTBEAT
 trap 'kill $HEARTBEAT 2> /dev/null' EXIT
 # step_messages <step dir>: the OpenROAD INFO / WARNING / ERROR messages of a step, in order, without the messages
