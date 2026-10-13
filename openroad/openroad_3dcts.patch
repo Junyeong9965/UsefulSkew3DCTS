@@ -282,10 +282,10 @@ index 0000000000..c283811283
 +}  // namespace cts
 diff --git a/src/cts/src/ClockRefinement.cpp b/src/cts/src/ClockRefinement.cpp
 new file mode 100644
-index 0000000000..cc6cd3547b
+index 0000000000..bbfce984a9
 --- /dev/null
 +++ b/src/cts/src/ClockRefinement.cpp
-@@ -0,0 +1,1128 @@
+@@ -0,0 +1,1127 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright (c) 2026, ABKGroup
 +//
@@ -1336,10 +1336,9 @@ index 0000000000..cc6cd3547b
 +  }
 +  logger->info(CTS,
 +               997,
-+               "Clock refinement evaluations full/incremental {}/{}; final whole-design check "
-+               "differs from the kept state by {:.6f} ps (counts equal); selector {:.1f} s, "
++               "Clock refinement evaluations full/incremental {}/{}; selector {:.1f} s, "
 +               "final check {:.1f} s",
-+               selT.nFull, selT.nIncr, d, selSec, finSec);
++               selT.nFull, selT.nIncr, selSec, finSec);
 +  {
 +    std::ofstream tf(rd + "/refine_eval_stats.csv");
 +    tf.precision(9);
@@ -2005,7 +2004,7 @@ index 0000000000..543e31b1d3
 +}  // namespace cts
 diff --git a/src/cts/src/CtsSkewLpSolver.cpp b/src/cts/src/CtsSkewLpSolver.cpp
 new file mode 100644
-index 0000000000..d36878d339
+index 0000000000..af1cc2bd4b
 --- /dev/null
 +++ b/src/cts/src/CtsSkewLpSolver.cpp
 @@ -0,0 +1,1371 @@
@@ -3158,7 +3157,7 @@ index 0000000000..d36878d339
 +  if (n_hold_ghost > 0) {
 +    logger_->info(utl::CTS,
 +                  CTS_LP_VARS + 2,
-+                  "Skew LP: skipped {} hold edges with unmeasured hold corner",
++                  "Skew LP: {} edges with setup timing only (no hold constraint)",
 +                  n_hold_ghost);
 +  }
 +
@@ -7076,7 +7075,7 @@ index 0000000000..d558d4e477
 +
 +}  // namespace cts::early
 diff --git a/src/cts/src/HTreeBuilder.cpp b/src/cts/src/HTreeBuilder.cpp
-index 19710ceb81..159dff2c67 100644
+index 19710ceb81..033c2ba3d5 100644
 --- a/src/cts/src/HTreeBuilder.cpp
 +++ b/src/cts/src/HTreeBuilder.cpp
 @@ -3,16 +3,28 @@
@@ -7209,7 +7208,7 @@ index 19710ceb81..159dff2c67 100644
        mapLocationToSink_[normLocation] = &inst;
        if (!fuzzyEqual(inst.getInsertionDelay(), 0.0, 1e-6)) {
          setSinkInsertionDelay(normLocation,
-@@ -172,84 +267,219 @@ void HTreeBuilder::preSinkClustering(
+@@ -172,84 +267,204 @@ void HTreeBuilder::preSinkClustering(
          std::round(bestDiameter / options_->getDbUnits() * wireSegmentUnit_));
    }
  
@@ -7218,12 +7217,6 @@ index 19710ceb81..159dff2c67 100644
 +
    unsigned clusterCount = 0;
  
-+  // Hybrid-bond equivalent wire distance, reported for cross-tier clusters.
-+  const double wire_res_per_unit = cts3dDb_->getResPerDBU(0) * wireSegmentUnit_;
-+  const double wire_cap_per_unit = cts3dDb_->getCapPerDBU(0) * wireSegmentUnit_;
-+  const double hb_equivalent_dist = cts3dDb_->getHbtEquivalentDistance(
-+      wire_res_per_unit, wire_cap_per_unit);
-+
    std::vector<std::pair<float, float>> newSinkLocations;
 -  for (const std::vector<unsigned>& cluster :
 -       matching.sinkClusteringSolution()) {
@@ -7460,15 +7453,6 @@ index 19710ceb81..159dff2c67 100644
 -      if (!secondLevel) {
 -        clockSubNet.setLeafLevel(true);
 +      if (tier0_count > 0 && tier1_count > 0) {
-+        logger_->warn(CTS,
-+                      571,
-+                      "Cross-tier cluster detected: cluster={}, tier0={}, "
-+                      "tier1={}, dominant_tier={}, HB_penalty={:.1f}um",
-+                      clusterCount,
-+                      tier0_count,
-+                      tier1_count,
-+                      cts3dDb_->getDominantTier(clusterClockInsts),
-+                      hb_equivalent_dist);
        }
  
 -      const std::pair<float, float> point(rootBufLoc.getX(), rootBufLoc.getY());
@@ -7486,7 +7470,7 @@ index 19710ceb81..159dff2c67 100644
    topLevelSinksClustered_ = std::move(newSinkLocations);
    if (clusterCount) {
      treeBufLevels_++;
-@@ -259,6 +489,37 @@ void HTreeBuilder::preSinkClustering(
+@@ -259,6 +474,31 @@ void HTreeBuilder::preSinkClustering(
                  19,
                  " Total number of sinks after clustering: {}.",
                  topLevelSinksClustered_.size());
@@ -7514,17 +7498,11 @@ index 19710ceb81..159dff2c67 100644
 +                  "{} / {} sinks missing from mapLocationToSink_.",
 +                  missingCount,
 +                  topLevelSinksClustered_.size());
-+  } else {
-+    logger_->info(CTS,
-+                  427,
-+                  "All {} sinks verified in mapLocationToSink_ (mapSize={})",
-+                  topLevelSinksClustered_.size(),
-+                  mapLocationToSink_.size());
 +  }
  }
  
  Point<double> HTreeBuilder::resolveLocationCollision(
-@@ -269,11 +530,7 @@ Point<double> HTreeBuilder::resolveLocationCollision(
+@@ -269,11 +509,7 @@ Point<double> HTreeBuilder::resolveLocationCollision(
    // Collision check and jittering to ensure unique coordinates
    unsigned jitterCount = 0;
    while (true) {
@@ -7537,7 +7515,7 @@ index 19710ceb81..159dff2c67 100644
      if (mapLocationToSink_.find(checkKey) == mapLocationToSink_.end()) {
        break;
      }
-@@ -352,6 +609,21 @@ void HTreeBuilder::initSinkRegion()
+@@ -352,6 +588,21 @@ void HTreeBuilder::initSinkRegion()
               wireSegmentUnit_);
    // clang-format on
  
@@ -7559,7 +7537,7 @@ index 19710ceb81..159dff2c67 100644
    preSinkClustering(topLevelSinks, sinkInsts, maxDiameter, clusterSize);
    if (topLevelSinks.size() <= min_clustering_sinks
        || !(options_->getSinkClustering())) {
-@@ -1265,9 +1537,60 @@ void HTreeBuilder::run()
+@@ -1265,9 +1516,53 @@ void HTreeBuilder::run()
    numMaxLeafSinks_ = options_->getNumMaxLeafSinks();
    minLengthSinkRegion_ = techChar_->getMinSegmentLength() * 2;
  
@@ -7568,14 +7546,9 @@ index 19710ceb81..159dff2c67 100644
 +        CTS, 400, "{} skew targets loaded", cts3dDb_->getSkewTargetCount());
 +  }
 +
-+  auto prof_t0 = std::chrono::high_resolution_clock::now();
    initSinkRegion();
-+  auto prof_t1 = std::chrono::high_resolution_clock::now();
-+  double prof_clustering_s
-+      = std::chrono::duration<double>(prof_t1 - prof_t0).count();
-+  logger_->info(
-+      CTS, 911, "Profile: initSinkRegion (clustering) {:.1f}s", prof_clustering_s);
-+
+ 
+-  for (int level = 1; level <= clockTreeMaxDepth_; ++level) {
 +  // Macro flat bypass: a macro tree whose sinks are all block instances and
 +  // that has at most kMacroFlatMaxSinks sinks is built as one root buffer
 +  // driving every macro clock pin (no H-tree levels).
@@ -7602,8 +7575,7 @@ index 19710ceb81..159dff2c67 100644
 +      }
 +    }
 +  }
- 
--  for (int level = 1; level <= clockTreeMaxDepth_; ++level) {
++
 +  // Depth limit of a macro tree that is not built flat.
 +  int effectiveMaxDepth = clockTreeMaxDepth_;
 +  if (type_ == TreeType::MacroTree && kMacroTreeMaxDepth < effectiveMaxDepth) {
@@ -7616,61 +7588,23 @@ index 19710ceb81..159dff2c67 100644
 +    effectiveMaxDepth = kMacroTreeMaxDepth;
 +  }
 +
-+  auto prof_htree_t0 = std::chrono::high_resolution_clock::now();
 +  for (int level = 1; level <= effectiveMaxDepth; ++level) {
      const unsigned numSinksPerSubRegion
          = computeNumberOfSinksPerSubRegion(level);
      double regionWidth, regionHeight;
-@@ -1300,6 +1623,15 @@ void HTreeBuilder::run()
-     }
-   }
- 
-+  auto prof_htree_t1 = std::chrono::high_resolution_clock::now();
-+  double prof_htree_s
-+      = std::chrono::duration<double>(prof_htree_t1 - prof_htree_t0).count();
-+  logger_->info(CTS,
-+                912,
-+                "Profile: H-tree level loop ({} levels) {:.1f}s",
-+                static_cast<int>(topologyForEachLevel_.size()),
-+                prof_htree_s);
-+
-   if (topologyForEachLevel_.empty()) {
-     createSingleBufferClockNet();
-     treeBufLevels_++;
-@@ -1320,7 +1652,32 @@ void HTreeBuilder::run()
+@@ -1320,7 +1615,11 @@ void HTreeBuilder::run()
    if (options_->getObstructionAware()) {
      legalize();
    }
 +
 +  initDelayTapParams();
 +
-+  auto prof_subnets_t0 = std::chrono::high_resolution_clock::now();
    createClockSubNets();
-+  auto prof_subnets_t1 = std::chrono::high_resolution_clock::now();
-+  double prof_subnets_s
-+      = std::chrono::duration<double>(prof_subnets_t1 - prof_subnets_t0)
-+            .count();
-+  logger_->info(CTS,
-+                913,
-+                "Profile: createClockSubNets (leaf + delay taps) {:.1f}s",
-+                prof_subnets_s);
-+
-+  auto prof_total_t1 = std::chrono::high_resolution_clock::now();
-+  double prof_total_s
-+      = std::chrono::duration<double>(prof_total_t1 - prof_t0).count();
-+  logger_->info(CTS,
-+                914,
-+                "Profile: run() total {:.1f}s (clustering={:.1f} htree={:.1f} "
-+                "subnets={:.1f})",
-+                prof_total_s,
-+                prof_clustering_s,
-+                prof_htree_s,
-+                prof_subnets_s);
 +
    // clang-format off
    debugPrint(logger_, CTS, "legalizer", 3, "Htree file {} has been generated",
               plotHTree());
-@@ -1329,6 +1686,50 @@ void HTreeBuilder::run()
+@@ -1329,6 +1628,44 @@ void HTreeBuilder::run()
    // clang-format on
  }
  
@@ -7683,13 +7617,7 @@ index 19710ceb81..159dff2c67 100644
 +  delayTapsEnabled_ = true;
 +  tapMaxDepth_ = kDefaultTapMaxDepth;
 +
-+  {
-+    auto hb_t0 = std::chrono::high_resolution_clock::now();
-+    loadHoldBudgets();
-+    auto hb_t1 = std::chrono::high_resolution_clock::now();
-+    double hb_s = std::chrono::duration<double>(hb_t1 - hb_t0).count();
-+    logger_->info(CTS, 918, "Profile: loadHoldBudgets {:.1f}s", hb_s);
-+  }
++  loadHoldBudgets();
 +
 +  // One tap stage = the characterization buffer driving its own input cap.
 +  tapStageDelay_ = kDefaultTapStageDelayNs;
@@ -7721,7 +7649,7 @@ index 19710ceb81..159dff2c67 100644
  bool HTreeBuilder::isNumberOfSinksTooSmall(unsigned numSinksPerSubRegion) const
  {
    if (options_->getMaxFanout()) {
-@@ -1830,8 +2231,9 @@ void HTreeBuilder::initTopLevelSinks(
+@@ -1830,8 +2167,9 @@ void HTreeBuilder::initTopLevelSinks(
  {
    sinkLocations.clear();
    clock_.forEachSink([&](const ClockInst& sink) {
@@ -7733,7 +7661,7 @@ index 19710ceb81..159dff2c67 100644
      sinkInsts.emplace_back(&sink);
    });
  }
-@@ -1890,8 +2292,10 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
+@@ -1890,8 +2228,10 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
      branchPt2 = Point<double>(means[1].first, means[1].second);
    }
  
@@ -7744,7 +7672,7 @@ index 19710ceb81..159dff2c67 100644
    unsigned movedSinks = 0;
    const double errorFactor = 1.2;
    for (int clusterIdx = 0; clusterIdx < clusters.size(); ++clusterIdx) {
-@@ -1927,18 +2331,174 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
+@@ -1927,18 +2267,174 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
    }
  }
  
@@ -7923,7 +7851,7 @@ index 19710ceb81..159dff2c67 100644
  
    if (topBufferName_.empty()) {
      topBufferName_ = rootBuffer.getName();
-@@ -1970,13 +2530,47 @@ void HTreeBuilder::createClockSubNets()
+@@ -1970,13 +2466,25 @@ void HTreeBuilder::createClockSubNets()
      if (topLevelTopology.getBranchSinksLocations(idx).empty()) {
        return;
      }
@@ -7939,28 +7867,6 @@ index 19710ceb81..159dff2c67 100644
 +                  branch_tier,
 +                  branch_root_buffer);
 +
-+    if (branch_tier != root_tier) {
-+      const double hb_res = cts3dDb_->getHbtResistance();
-+      const double hb_cap = cts3dDb_->getHbtCapacitance();
-+      const double hb_delay = 0.693 * hb_res * hb_cap;
-+
-+      const double wire_res_per_unit
-+          = cts3dDb_->getResPerDBU(branch_tier) * wireSegmentUnit_;
-+      const double wire_cap_per_unit
-+          = cts3dDb_->getCapPerDBU(branch_tier) * wireSegmentUnit_;
-+      const double hb_equivalent_dist = cts3dDb_->getHbtEquivalentDistance(
-+          wire_res_per_unit, wire_cap_per_unit);
-+
-+      logger_->warn(CTS,
-+                    362,
-+                    "Cross-tier branch L1: branch_tier={}, root_tier={}, "
-+                    "HB_delay={:.3e}s, equiv_dist={:.1f}um",
-+                    branch_tier,
-+                    root_tier,
-+                    hb_delay,
-+                    hb_equivalent_dist);
-+    }
-+
      Point<double> legalBranchPoint
 -        = legalizeOneBuffer(branchPoint, options_->getRootBuffer());
 +        = legalizeOneBuffer(branchPoint, branch_root_buffer);
@@ -7973,7 +7879,7 @@ index 19710ceb81..159dff2c67 100644
  		 "createClockSubNets level 1 clk_buf_1_{}_ : {} => {}",
  		 std::to_string(idx), branchPoint, legalBranchPoint);
      } else {
-@@ -1996,14 +2590,18 @@ void HTreeBuilder::createClockSubNets()
+@@ -1996,14 +2504,18 @@ void HTreeBuilder::createClockSubNets()
                             rootClockSubNet,
                             *techChar_,
                             wireSegmentUnit_,
@@ -7995,7 +7901,7 @@ index 19710ceb81..159dff2c67 100644
      }
      if (isFirstPoint) {
        treeBufLevels_ += builder.getNumBufferLevels();
-@@ -2027,8 +2625,48 @@ void HTreeBuilder::createClockSubNets()
+@@ -2027,8 +2539,22 @@ void HTreeBuilder::createClockSubNets()
        LevelTopology& parentTopology = topologyForEachLevel_[levelIdx - 1];
        Point<double> parentPoint = parentTopology.getBranchingPoint(parentIdx);
  
@@ -8013,39 +7919,13 @@ index 19710ceb81..159dff2c67 100644
 +                 branch_tier,
 +                 branch_root_buffer);
 +
-+      const int parent_tier = cts3dDb_->getDominantTier(
-+          parentTopology.getBranchSinksLocations(parentIdx),
-+          mapLocationToSink_);
-+      if (branch_tier != parent_tier) {
-+        const double hb_res = cts3dDb_->getHbtResistance();
-+        const double hb_cap = cts3dDb_->getHbtCapacitance();
-+        const double hb_delay = 0.693 * hb_res * hb_cap;
-+
-+        const double wire_res_per_unit
-+            = cts3dDb_->getResPerDBU(branch_tier) * wireSegmentUnit_;
-+        const double wire_cap_per_unit
-+            = cts3dDb_->getCapPerDBU(branch_tier) * wireSegmentUnit_;
-+        const double hb_equivalent_dist = cts3dDb_->getHbtEquivalentDistance(
-+            wire_res_per_unit, wire_cap_per_unit);
-+
-+        logger_->warn(CTS,
-+                      363,
-+                      "Cross-tier branch L{}: branch_tier={}, parent_tier={}, "
-+                      "HB_delay={:.3e}s, equiv_dist={:.1f}um",
-+                      levelIdx + 1,
-+                      branch_tier,
-+                      parent_tier,
-+                      hb_delay,
-+                      hb_equivalent_dist);
-+      }
-+
        Point<double> legalBranchPoint
 -          = legalizeOneBuffer(branchPoint, options_->getRootBuffer());
 +          = legalizeOneBuffer(branchPoint, branch_root_buffer);
        commitMoveLoc(branchPoint, legalBranchPoint);
  
        // clang-format off
-@@ -2056,7 +2694,9 @@ void HTreeBuilder::createClockSubNets()
+@@ -2056,7 +2582,9 @@ void HTreeBuilder::createClockSubNets()
                               *parentTopology.getBranchDrivingSubNet(parentIdx),
                               *techChar_,
                               wireSegmentUnit_,
@@ -8056,7 +7936,7 @@ index 19710ceb81..159dff2c67 100644
  
        // Set clock tree level the first time only.
        if (builder.getDrivingSubNet()->getTreeLevel() < 0) {
-@@ -2064,12 +2704,14 @@ void HTreeBuilder::createClockSubNets()
+@@ -2064,12 +2592,14 @@ void HTreeBuilder::createClockSubNets()
        }
  
        if (!options_->getTreeBuffer().empty()) {
@@ -8073,7 +7953,7 @@ index 19710ceb81..159dff2c67 100644
        }
        if (isFirstPoint) {
          treeBufLevels_ += builder.getNumBufferLevels();
-@@ -2081,30 +2723,762 @@ void HTreeBuilder::createClockSubNets()
+@@ -2081,30 +2611,756 @@ void HTreeBuilder::createClockSubNets()
  
    LevelTopology& leafTopology = topologyForEachLevel_.back();
    unsigned numSinks = 0;
@@ -8120,7 +8000,7 @@ index 19710ceb81..159dff2c67 100644
 +        }
 +        if (isMacroBlockInst(ff->getDbInst())) {
 +          depth = 0;
-         }
++        }
 +        return depth;
 +      };
 +
@@ -8148,7 +8028,7 @@ index 19710ceb81..159dff2c67 100644
 +              break;
 +            }
 +          }
-+        }
+         }
 +        if (sinkIt == mapLocationToSink_.end()) {
 +          // Second-level clustering or legalizeOneBuffer can move a centroid
 +          // beyond eps; the nearest map entry is then used, so every leaf
@@ -8253,7 +8133,7 @@ index 19710ceb81..159dff2c67 100644
 +            }
 +          } else {
 +            ++branchDirectFFs;
-+          }
+           }
 +        } else {
 +          // Unclustered register: its own chain on the branch net.
 +          const std::string ffName = sinkRegisterName(sinkInst);
@@ -8266,7 +8146,7 @@ index 19710ceb81..159dff2c67 100644
 +                       "delay taps (unclustered): '{}' target={:.4f}ns",
 +                       ffName,
 +                       ffTarget);
-           }
++          }
 +          int depth = tapDepth(sinkInst, ffTarget);
 +          if (depth == 0) {
 +            subNet->addInst(*sinkInst);
@@ -8362,12 +8242,6 @@ index 19710ceb81..159dff2c67 100644
 -          ++numSinks;
 +      if (!branchSinks.empty()) {
 +        if (emptyLeaves > 0) {
-+          logger_->info(CTS,
-+                        585,
-+                        "Shared TAP branch {}: {} all-positive leaves retain "
-+                        "no depth-0 FF; empty legacy leaf subnets are skipped",
-+                        idx,
-+                        emptyLeaves);
          }
 -      });
 +        branchTapBufs += buildSharedDelayChains(idx,
@@ -8852,7 +8726,7 @@ index 19710ceb81..159dff2c67 100644
  }
  
  void HTreeBuilder::createSingleBufferClockNet()
-@@ -2242,7 +3616,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
+@@ -2242,7 +3498,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
                                 ClockSubNet& drivingSubNet,
                                 const TechChar& techChar,
                                 const unsigned techCharDistUnit,
@@ -8863,7 +8737,7 @@ index 19710ceb81..159dff2c67 100644
      : instPrefix_(instPrefix),
        netPrefix_(netPrefix),
        root_(root),
-@@ -2252,7 +3628,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
+@@ -2252,7 +3510,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
        techCharDistUnit_(techCharDistUnit),
        clock_(&clock),
        drivingSubNet_(&drivingSubNet),
@@ -8874,7 +8748,7 @@ index 19710ceb81..159dff2c67 100644
  {
  }
  
-@@ -2286,15 +3664,19 @@ void SegmentBuilder::build(const std::string& forceBuffer)
+@@ -2286,15 +3546,19 @@ void SegmentBuilder::build(const std::string& forceBuffer)
        const std::string buffMaster = !forceBuffer.empty()
                                           ? forceBuffer
                                           : wireSegment.getBufferMaster(buffer);
@@ -8896,7 +8770,7 @@ index 19710ceb81..159dff2c67 100644
  
        // clang-format off
        if (bufferLoc != legalBufferLoc) {
-@@ -2332,11 +3714,15 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
+@@ -2332,11 +3596,15 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
      return;
    }
  
@@ -8913,7 +8787,7 @@ index 19710ceb81..159dff2c67 100644
    tree_->addTreeLevelBuffer(&newBuffer);
    // clang-format off
    debugPrint(getTree()->getLogger(), CTS, "legalizer", 2,
-@@ -2349,4 +3735,497 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
+@@ -2349,4 +3617,497 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
    numBufferLevels_++;
  }
  
@@ -13011,7 +12885,7 @@ index 1c471a32d0..50a3107764 100644
    std::vector<TreeBuilder*> children_;
    // Tree buffer levels. Number of buffers inserted in first leg of the HTree
 diff --git a/src/cts/src/TritonCTS.cpp b/src/cts/src/TritonCTS.cpp
-index 42edd07a04..5c7f87d671 100644
+index 42edd07a04..7f3af53d51 100644
 --- a/src/cts/src/TritonCTS.cpp
 +++ b/src/cts/src/TritonCTS.cpp
 @@ -21,16 +21,22 @@
@@ -13594,7 +13468,7 @@ index 42edd07a04..5c7f87d671 100644
    destroyClockModNet(pin_driver);
  
    // re-connect top buffer that separates macros from registers
-@@ -1617,16 +1887,47 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1617,16 +1887,44 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      if (topRegBuffer) {
        odb::dbITerm* topRegBufferInputPin = getFirstInput(topRegBuffer);
        topRegBufferInputPin->connect(builder->getDrivingNet());
@@ -13634,9 +13508,6 @@ index 42edd07a04..5c7f87d671 100644
 +              "  Root '{}' input connected to topClockNet '{}'",
 +              rootName, topClockNet->getConstName());
 +        }
-+      } else {
-+        logger_->info(CTS, 884,
-+            "  Root candidate '{}' not found in ODB", rootName);
 +      }
 +    }
 +    if (!anyConnected) {
@@ -13647,7 +13518,7 @@ index 42edd07a04..5c7f87d671 100644
    topClockNet->setSigType(odb::dbSigType::CLOCK);
  
    std::map<int, int> fanoutcount;
-@@ -1640,9 +1941,29 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1640,9 +1938,25 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      bool outputPinFound = true;
      bool inputPinFound = true;
      bool leafLevelNet = subNet.isLeafLevel();
@@ -13665,10 +13536,6 @@ index 42edd07a04..5c7f87d671 100644
 +    // removedSinks so that the tree walk (branchBufferCount) and the sink
 +    // connection below skip it; the unused buffer is deleted further down.
 +    if (subNet.getNumSinks() == 0 && &subNet != rootSubNet) {
-+      logger_->warn(CTS, 715,
-+          "  Orphan subnet '{}' (0 sinks, driver='{}') — skipping ODB net creation",
-+          subNet.getName(),
-+          subNet.getDriver() ? subNet.getDriver()->getName() : "NULL");
 +      if (subNet.getDriver()) {
 +        removedSinks.insert(subNet.getDriver());
 +      }
@@ -13678,7 +13545,7 @@ index 42edd07a04..5c7f87d671 100644
      odb::dbNet* clkSubNet
          = odb::dbNet::create(block_, subNet.getName().c_str());
      subNet.setNetObj(clkSubNet);
-@@ -1652,7 +1973,7 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1652,7 +1966,7 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
  
      odb::dbInst* driver = subNet.getDriver()->getDbInst();
      odb::dbITerm* driverInputPin = getFirstInput(driver);
@@ -13687,7 +13554,7 @@ index 42edd07a04..5c7f87d671 100644
      odb::dbITerm* outputPin = driver->getFirstOutput();
      if (outputPin == nullptr) {
        outputPinFound = false;
-@@ -1666,6 +1987,10 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1666,6 +1980,10 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      }
  
      subNet.forEachSink([&](ClockInst* inst) {
@@ -13698,7 +13565,7 @@ index 42edd07a04..5c7f87d671 100644
        odb::dbITerm* inputPin = nullptr;
        if (inst->isClockBuffer()) {
          odb::dbInst* sink = inst->getDbInst();
-@@ -1702,14 +2027,16 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1702,14 +2020,16 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      }
  
      if (!inputPinFound || !outputPinFound) {
@@ -13723,7 +13590,7 @@ index 42edd07a04..5c7f87d671 100644
      }
    });
  
-@@ -1734,6 +2061,34 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
+@@ -1734,6 +2054,34 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
      }
    });
  
@@ -13758,7 +13625,7 @@ index 42edd07a04..5c7f87d671 100644
    logger_->info(
        CTS, 12, "    Minimum number of buffers in the clock path: {}.", minPath);
    logger_->info(
-@@ -1987,7 +2342,14 @@ std::pair<int, int> TritonCTS::branchBufferCount(ClockInst* inst,
+@@ -1987,7 +2335,14 @@ std::pair<int, int> TritonCTS::branchBufferCount(ClockInst* inst,
                                                   Clock& clockNet)
  {
    odb::dbInst* sink = inst->getDbInst();
@@ -13773,7 +13640,7 @@ index 42edd07a04..5c7f87d671 100644
    int minPath = std::numeric_limits<int>::max();
    int maxPath = std::numeric_limits<int>::min();
    for (odb::dbITerm* sinkITerms : outITerm->getNet()->getITerms()) {
-@@ -2051,11 +2413,43 @@ void TritonCTS::checkUpstreamConnections(odb::dbNet* net)
+@@ -2051,11 +2406,43 @@ void TritonCTS::checkUpstreamConnections(odb::dbNet* net)
  
  void TritonCTS::createClockBuffers(Clock& clockNet, odb::dbModule* parent)
  {
@@ -13817,7 +13684,7 @@ index 42edd07a04..5c7f87d671 100644
      newInst->setSourceType(odb::dbSourceType::TIMING);
      inst.setInstObj(newInst);
      inst2clkbuf_[newInst] = &inst;
-@@ -2152,7 +2546,7 @@ bool TritonCTS::isSink(odb::dbITerm* iterm)
+@@ -2152,7 +2539,7 @@ bool TritonCTS::isSink(odb::dbITerm* iterm)
      return true;
    }
  
@@ -13826,7 +13693,7 @@ index 42edd07a04..5c7f87d671 100644
      return true;
    }
  
-@@ -2250,19 +2644,38 @@ static float getInputCap(const sta::LibertyCell* cell)
+@@ -2250,19 +2637,38 @@ static float getInputCap(const sta::LibertyCell* cell)
    return 0.0;
  }
  
@@ -13867,7 +13734,7 @@ index 42edd07a04..5c7f87d671 100644
    return bestCell;
  }
  
-@@ -2283,7 +2696,7 @@ int TritonCTS::writeDummyLoadsToDb(Clock& clockNet,
+@@ -2283,7 +2689,7 @@ int TritonCTS::writeDummyLoadsToDb(Clock& clockNet,
    int nDummies = 0;
    clockNet.forEachSubNet([&](ClockSubNet& subNet) {
      subNet.forEachSink([&](ClockInst* inst) {
@@ -13876,7 +13743,7 @@ index 42edd07a04..5c7f87d671 100644
            && !sta::fuzzyEqual(inst->getOutputCap(),
                                inst->getIdealOutputCap())) {
          odb::dbInst* dummyInst
-@@ -2314,6 +2727,9 @@ bool TritonCTS::computeIdealOutputCaps(Clock& clockNet)
+@@ -2314,6 +2720,9 @@ bool TritonCTS::computeIdealOutputCaps(Clock& clockNet)
      driver2subnet_[driver] = &subNet;
      float sinkCapTotal = 0.0;
      subNet.forEachSink([&](ClockInst* inst) {
@@ -13886,7 +13753,7 @@ index 42edd07a04..5c7f87d671 100644
        odb::dbITerm* inputPin = inst->isClockBuffer()
                                     ? getFirstInput(inst->getDbInst())
                                     : inst->getDbInputPin();
-@@ -2469,7 +2885,20 @@ odb::dbInst* TritonCTS::insertDummyCell(
+@@ -2469,7 +2878,20 @@ odb::dbInst* TritonCTS::insertDummyCell(
      return nullptr;
    }
    float deltaCap = inst->getIdealOutputCap() - inst->getOutputCap();
@@ -13908,7 +13775,7 @@ index 42edd07a04..5c7f87d671 100644
    // clang-format off
    debugPrint(logger_, CTS, "dummy load", 1, "insertDummyCell {} at {}",
               inst->getName(), dummyCell->name());
-@@ -2501,10 +2930,34 @@ ClockInst& TritonCTS::placeDummyCell(Clock& clockNet,
+@@ -2501,10 +2923,34 @@ ClockInst& TritonCTS::placeDummyCell(Clock& clockNet,
        = options_->getDummyLoadPrefix() + std::to_string(dummyLoadIndex_++);
    dummyInst = odb::dbInst::create(block_, master, cellName.c_str());
    dummyInst->setSourceType(odb::dbSourceType::TIMING);
@@ -13945,7 +13812,7 @@ index 42edd07a04..5c7f87d671 100644
    // clang-format off
    debugPrint(logger_, CTS, "dummy load", 1, "  placed dummy instance {} at {}",
               dummyInst->getName(), dummyInst->getLocation());
-@@ -2596,4 +3049,154 @@ void TritonCTS::balanceMacroRegisterLatencies()
+@@ -2596,4 +3042,154 @@ void TritonCTS::balanceMacroRegisterLatencies()
    }
  }
  

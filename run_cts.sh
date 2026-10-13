@@ -9,8 +9,8 @@
 #     -p period    clock period in ps; the placement must exist as inputs/<case>/T<period>/ (default: flow/configs/cases.tsv)
 #     -w run_dir   output directory (default: runs/<case> for the default period, runs/<case>_T<period> otherwise)
 #   env: THREADS (default 16) = thread budget of one case (multiplied by the lane count for "all").
-#   output: <run_dir>/cts.log (run log) and <run_dir>/OUTPUT/4_cts.{odb,def,v,sdc} (CTS checkpoint for routing);
-#           step logs and intermediate data in <run_dir>/work/
+#   output: <run_dir>/logs/4_cts.log (run log), <run_dir>/results/4_cts.{odb,def,v,sdc} (CTS result for routing),
+#           <run_dir>/reports/4_cts_timing.rpt (setup/hold TNS and WNS of the result)
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$ROOT/flow/cts/common.sh"
@@ -30,7 +30,7 @@ if [[ $c == all ]]; then
   run_lane() { local i; for ((i = $1; i < ${#cases[@]}; i += lanes)); do "$ROOT/run_cts.sh" "${cases[i]}"; done; }
   for ((l = 0; l < lanes; l++)); do run_lane $l > "$ROOT/runs/run_all_lane$l.log" 2>&1 & done
   wait
-  for x in "${cases[@]}"; do printf '%-14s %s\n' "$x" "$(grep 'RESULT' "$ROOT/runs/$x/cts.log" 2>/dev/null | tail -1)"; done
+  for x in "${cases[@]}"; do printf '%-14s %s\n' "$x" "$(grep -E '^(CTS result|FAILED)' "$ROOT/runs/$x/logs/4_cts.log" 2>/dev/null | tail -1)"; done
   exit 0
 fi
 case_info "$c" || exit 2
@@ -42,9 +42,10 @@ done
 if [[ -z $work ]]; then
   if [[ $period == "$PERIOD_PS" ]]; then work=$ROOT/runs/$c; else work=$ROOT/runs/${c}_T$period; fi
 fi
-mkdir -p "$work/work"; work=$(cd "$work" && pwd)
-# one run log, <run_dir>/cts.log (also printed): every step with its time and the timing after it, then the summary
-bash "$ROOT/flow/cts/cts_flow.sh" "$c" "$src" "$work" 2>&1 | tee "$work/cts.log"
+mkdir -p "$work"; work=$(cd "$work" && pwd)
+exec 9< "$work"; flock -n 9 || { echo "$work is in use by another run" >&2; exit 1; }
+rm -rf "$work/logs"; mkdir -p "$work/logs"
+# run log <run_dir>/logs/4_cts.log (also printed)
+bash "$ROOT/flow/cts/cts_flow.sh" "$c" "$src" "$work" 2>&1 | tee "$work/logs/4_cts.log"
 rc=${PIPESTATUS[0]}
-[[ $rc == 0 ]] || echo "FAILED rc=$rc (see $work/cts.log and $work/work/logs/)" | tee -a "$work/cts.log"
 exit $rc

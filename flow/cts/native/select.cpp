@@ -672,7 +672,7 @@ int report_main(const std::vector<std::string>& a)
 {
   const std::string run = a.at(0), cas = a.at(1), out_arm = a.at(2), arm_dir = a.at(3), why = a.at(4);
   std::string plan = a.size() > 5 ? a[5] : "";
-  std::string O = join_path(run, "out");   // diagnostic tables stay in the work directory; OUTPUT/ holds the checkpoint
+  std::string O = join_path(run, "out");   // diagnostic tables stay in the work directory; results/ holds the checkpoint
   auto metrics = [](const std::string& path, std::vector<double>& m) {
     if (!path_exists(path)) return false;
     auto r = last_row(path);

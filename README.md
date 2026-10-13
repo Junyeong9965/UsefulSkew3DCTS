@@ -78,13 +78,13 @@ Main tools and libraries tested (Linux x86-64); the full dependency setup is in 
    Routing uses OpenROAD (10 detailed-routing iterations in `config.mk`; `DETAILED_ROUTE_END_ITERATION=<n>` overrides
    it), except the two `ariane133` cases, which use Cadence Innovus. Extraction (OpenRCX) and the final report run in
    OpenROAD. All cases: `./run_route.sh all -j <N>`.
-3. Check the results:
+3. Check the results in `runs/a7a7_aes/`:
 
-   | File | Content |
+   | Directory | Content |
    |---|---|
-   | `runs/a7a7_aes/cts.log` | run log of each CTS step and the final setup/hold TNS and WNS |
-   | `runs/a7a7_aes/OUTPUT/4_cts.{odb,def,v,sdc}` | CTS result used for routing |
-   | `runs/a7a7_aes/route/reports/asap7_3D/aes/openroad/6_finish.rpt` | post-route timing, power, area and wire length |
+   | `logs/` | CTS run log `4_cts.log` and the routing and final-report logs |
+   | `results/` | CTS result `4_cts.{odb,def,v,sdc}` and the routed design (`5_route.*`, `6_final.*`) |
+   | `reports/` | `4_cts_timing.rpt` (setup/hold TNS and WNS after CTS) and `6_finish.rpt` (post-route timing, power, area and wire length) |
 
 ## Benchmarks
 
