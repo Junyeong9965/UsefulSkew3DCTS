@@ -75,15 +75,15 @@ If OpenROAD reports a missing shared library, add the directory containing that 
    ```
    ./run_cts.sh a7a7_aes
    ```
-   `THREADS` (default 16) sets the number of timing-graph extraction processes and the thread count of the OpenROAD
-   sessions of a case (some steps use fewer). All ten cases: `./run_cts.sh all -j <N>` (N cases at a time;
-   N × THREADS should not exceed the number of cores).
+   `THREADS` (default 16) is the number of cores used by one case. To run all ten [cases](#benchmarks), use
+   `./run_cts.sh all -j <N>`, where N is the number of cases run concurrently. Keep N × THREADS within the available
+   core count.
 2. Route the CTS result (routing, parasitic extraction and final timing report):
    ```
    ./run_route.sh a7a7_aes
    ```
    Routing uses OpenROAD, except the two `ariane133` cases, which use Cadence Innovus. Extraction (OpenRCX) and the
-   final report run in OpenROAD. All cases: `./run_route.sh all -j <N>`.
+   final report run in OpenROAD. All ten cases: `./run_route.sh all -j <N>`, with N as above.
 3. Check the results in `runs/a7a7_aes/`:
 
    | Directory | Content |
