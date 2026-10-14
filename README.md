@@ -1,6 +1,7 @@
 # Useful-Skew Clock Tree Synthesis for Face-to-Face 3D ICs
 
 Clock tree synthesis (CTS) flow for face-to-face (F2F) stacked 3D ICs with hybrid bonding.
+The version used for the ISCAS 2027 submission is tagged `iscas2027`.
 
 <p align="center"><img src="images/cts_flow.png" width="100%" alt="Clock construction flow"></p>
 
