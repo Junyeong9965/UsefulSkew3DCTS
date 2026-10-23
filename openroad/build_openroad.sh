@@ -5,7 +5,7 @@
 #
 # 1. clones upstream OpenROAD into source_dir (skipped when source_dir already exists), checks out BASE_COMMIT and its
 #    submodules (OpenSTA, abc) and applies openroad_3dcts.patch (skipped when it is already applied);
-# 2. configures and builds the openroad target into source_dir/build (Release, C++17);
+# 2. configures and builds the openroad target into source_dir/build (Release; C++20, set by the upstream CMakeLists);
 # 3. prints the path of the binary; set CTS3D_OPENROAD in setup_env.sh to it.
 #
 # Dependencies are the upstream OpenROAD dependencies (OR-Tools, spdlog, Boost, yaml-cpp, Tcl, SWIG, Bison, Flex, lemon,
@@ -47,7 +47,7 @@ if [[ -d ${TCL_LIBRARY:-} ]]; then
   [[ -n $tcl_so ]] && TCL_LIBRARY=$tcl_so || unset TCL_LIBRARY
   [[ -n ${TCL_HEADER:-} || ! -f $tcl_dir/../include/tcl.h ]] || TCL_HEADER=$(realpath "$tcl_dir/../include/tcl.h")
 fi
-cfg=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DBUILD_GUI=${BUILD_GUI:-ON} -DENABLE_TESTS=OFF)
+cfg=(-DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=${BUILD_GUI:-ON} -DENABLE_TESTS=OFF)
 if [[ -n ${CMAKE_PREFIX_PATH:-} ]]; then cfg+=(-DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"); fi
 for v in CMAKE_C_COMPILER CMAKE_CXX_COMPILER BISON_EXECUTABLE FLEX_EXECUTABLE FLEX_INCLUDE_DIR LEMON_DIR \
          LEMON_INCLUDE_DIR LEMON_LIBRARY SWIG_EXECUTABLE CUDD_HEADER CUDD_LIB spdlog_DIR Boost_DIR TCL_LIBRARY TCL_HEADER; do

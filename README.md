@@ -34,11 +34,14 @@ OpenROAD tree.
 ## Requirements
 
 Linux x86-64 with the dependencies of [OpenROAD](https://github.com/The-OpenROAD-Project/OpenROAD), which its
-`etc/DependencyInstaller.sh` installs.
+`etc/DependencyInstaller.sh` installs. OpenROAD is built as C++20, which the LEMON 1.3.1 release does not support;
+use the OpenROAD fork of LEMON ([lemon-graph](https://github.com/The-OpenROAD-Project/lemon-graph), tag `1.3.1`), which
+the installer also uses, and set `LEMON_DIR` in `setup_env.sh` to its `share/lemon/cmake` directory if CMake does not
+find it.
 
 | Tool / library | Version |
 |---|---|
-| GCC (C++17) | 12.2.0 |
+| GCC (OpenROAD: C++20, flow helper programs: C++17) | 12.2.0 |
 | CMake | 3.25.1 |
 | OR-Tools | 9.15 |
 | Boost | 1.81.0 |
