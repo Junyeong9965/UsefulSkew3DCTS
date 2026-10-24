@@ -27,10 +27,18 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ $c == all ]]; then
   mapfile -t cases < <(case_list); mkdir -p "$ROOT/runs"
-  run_lane() { local i; for ((i = $1; i < ${#cases[@]}; i += lanes)); do "$ROOT/run_cts.sh" "${cases[i]}"; done; }
+  st=$ROOT/runs/.run_all_status; rm -f "$st".*
+  run_lane() { local i; for ((i = $1; i < ${#cases[@]}; i += lanes)); do
+    "$ROOT/run_cts.sh" "${cases[i]}"; echo "${cases[i]} $?" >> "$st.$1"; done; }
   for ((l = 0; l < lanes; l++)); do run_lane $l > "$ROOT/runs/run_all_lane$l.log" 2>&1 & done
   wait
-  for x in "${cases[@]}"; do printf '%-14s %s\n' "$x" "$(grep -E '^(Final|ERROR)' "$ROOT/runs/$x/logs/4_cts.log" 2>/dev/null | tail -1)"; done
+  nfail=0
+  for x in "${cases[@]}"; do rc=$(cat "$st".* 2>/dev/null | awk -v c="$x" '$1 == c {r = $2} END {print r}')
+    if [[ $rc == 0 ]]; then printf '%-14s %s\n' "$x" "$(grep -E '^(Final|ERROR)' "$ROOT/runs/$x/logs/4_cts.log" 2>/dev/null | tail -1)"
+    else printf '%-14s %s\n' "$x" "FAILED (exit ${rc:-?}; see runs/$x/logs)"; nfail=$((nfail + 1)); fi; done
+  rm -f "$st".*
+  # nonzero exit when any case failed
+  (( nfail == 0 )) || { echo "$nfail of ${#cases[@]} cases failed" >&2; exit 1; }
   exit 0
 fi
 case_info "$c" || exit 2

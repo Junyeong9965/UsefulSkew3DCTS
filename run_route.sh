@@ -21,12 +21,21 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ $c == all ]]; then
   mapfile -t cases < <(case_list); mkdir -p "$ROOT/runs"
-  run_lane() { local i; for ((i = $1; i < ${#cases[@]}; i += lanes)); do "$ROOT/run_route.sh" "${cases[i]}"; done; }
+  st=$ROOT/runs/.run_route_status; rm -f "$st".*
+  run_lane() { local i x; for ((i = $1; i < ${#cases[@]}; i += lanes)); do x=${cases[i]}
+    if [[ ! -s $ROOT/runs/$x/results/4_cts.def ]]; then echo "$x skip" >> "$st.$1"; continue; fi
+    "$ROOT/run_route.sh" "$x"; echo "$x $?" >> "$st.$1"; done; }
   for ((l = 0; l < lanes; l++)); do run_lane $l > "$ROOT/runs/run_route_lane$l.log" 2>&1 & done
   wait
+  nfail=0
   for x in "${cases[@]}"; do r=$ROOT/runs/$x/reports/6_finish.rpt
-    if [[ -s $r ]]; then printf '%-14s %s\n' "$x" "$(awk '/^finish report_tns/,/^finish hold timing/' "$r" | grep -E '^(tns|wns)' | head -4 | tr '\n' ' ')"
-    else printf '%-14s %s\n' "$x" "no route result"; fi; done
+    rc=$(cat "$st".* 2>/dev/null | awk -v c="$x" '$1 == c {r = $2} END {print r}')
+    if [[ $rc == skip ]]; then printf '%-14s %s\n' "$x" "no CTS checkpoint (skipped)"
+    elif [[ $rc == 0 && -s $r ]]; then printf '%-14s %s\n' "$x" "$(awk '/^finish report_tns/,/^finish hold timing/' "$r" | grep -E '^(tns|wns)' | head -4 | tr '\n' ' ')"
+    else printf '%-14s %s\n' "$x" "FAILED (exit ${rc:-?}; see runs/$x/logs)"; nfail=$((nfail + 1)); fi; done
+  rm -f "$st".*
+  # nonzero exit when any routed case failed (cases without a CTS checkpoint are skipped)
+  (( nfail == 0 )) || { echo "$nfail case(s) failed" >&2; exit 1; }
   exit 0
 fi
 case_info "$c" || exit 2
@@ -63,7 +72,9 @@ else
 fi
 mk ord-final || fail ord-final
 [[ -s $rep/6_finish.rpt ]] || fail "ord-final: 6_finish.rpt was not written"
-mv_out() { local f; for f in "$1"/*; do [[ -e $f && ${f##*/} != 4_cts.* ]] || continue; cp -rL "$f" "$2/" && rm -rf "$f"; done; }
+mv_out() { local f; for f in "$1"/*; do [[ -e $f && ${f##*/} != 4_cts.* ]] || continue
+  cp -rL "$f" "$2/" || fail "could not copy $f to $2"; rm -rf "$f"; done; }
+mkdir -p "$work/results" "$work/reports"
 mv_out "$res" "$work/results"; mv_out "$rep" "$work/reports"
 rm -rf "$R"; rmdir "$work/tmp" 2>/dev/null
 rpt=$work/reports/6_finish.rpt; log=$work/logs
