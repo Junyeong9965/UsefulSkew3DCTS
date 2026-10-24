@@ -34,14 +34,13 @@ OpenROAD tree.
 ## Requirements
 
 Linux x86-64 with the dependencies of [OpenROAD](https://github.com/The-OpenROAD-Project/OpenROAD), which its
-`etc/DependencyInstaller.sh` installs. OpenROAD is built as C++20, which the LEMON 1.3.1 release does not support;
-use the OpenROAD fork of LEMON ([lemon-graph](https://github.com/The-OpenROAD-Project/lemon-graph), tag `1.3.1`), which
-the installer also uses, and set `LEMON_DIR` in `setup_env.sh` to its `share/lemon/cmake` directory if CMake does not
-find it.
+`etc/DependencyInstaller.sh` installs. OpenROAD requires C++20. Use the OpenROAD-maintained LEMON fork
+([lemon-graph](https://github.com/The-OpenROAD-Project/lemon-graph), tag `1.3.1`) instead of the original LEMON 1.3.1
+release. The dependency installer may skip installation if the original version is already present.
 
-| Tool / library | Version |
+| Tool / library | Tested version |
 |---|---|
-| GCC (OpenROAD: C++20, flow helper programs: C++17) | 12.2.0 |
+| GCC | 12.2.0 |
 | CMake | 3.25.1 |
 | OR-Tools | 9.15 |
 | Boost | 1.81.0 |
@@ -49,19 +48,28 @@ find it.
 
 ## Build
 
-1. Install the dependencies listed in Requirements.
+1. Clone upstream OpenROAD at the base commit and install its dependencies:
+   ```bash
+   git clone https://github.com/The-OpenROAD-Project/OpenROAD.git ../OpenROAD-3dcts
+   git -C ../OpenROAD-3dcts checkout 0609245cc439dfaa667571b5ca386a6a265c0146
+   git -C ../OpenROAD-3dcts submodule update --init --recursive
+   sudo ../OpenROAD-3dcts/etc/DependencyInstaller.sh -base
+   ../OpenROAD-3dcts/etc/DependencyInstaller.sh -common -local
+   ```
+   `-base` installs system packages; `-common -local` installs the other dependencies in `~/.local`.
 
 2. Create your configuration file:
    ```bash
    cp setup_env.example.sh setup_env.sh
    ```
-   If needed, edit the dependency paths and compiler settings in `setup_env.sh`.
+   If needed, edit the dependency paths and compiler settings in `setup_env.sh`. If CMake does not find the LEMON
+   fork, set `LEMON_DIR` to its `share/lemon/cmake` directory.
 
 3. Build the patched OpenROAD:
    ```bash
    openroad/build_openroad.sh ../OpenROAD-3dcts
    ```
-   The script uses upstream commit `0609245c` and applies `openroad/openroad_3dcts.patch`.
+   The script uses the clone of step 1 (upstream commit `0609245c`) and applies `openroad/openroad_3dcts.patch`.
 
 4. Set `CTS3D_OPENROAD` in `setup_env.sh` to the binary path printed by the build script, then build the helper
    programs:

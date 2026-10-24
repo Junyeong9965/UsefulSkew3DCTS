@@ -20,5 +20,6 @@ export THREADS=${THREADS:-16}
 # export CMAKE_PREFIX_PATH=/path/to/or-tools:/path/to/spdlog:/path/to/yaml-cpp:/path/to/boost
 # export CMAKE_C_COMPILER=/path/to/gcc-12/bin/gcc CMAKE_CXX_COMPILER=/path/to/gcc-12/bin/c++
 # A dependency that CMake still does not find can be set by its CMake variable, for example
+# (LEMON: the OpenROAD fork lemon-graph, tag 1.3.1, not the original LEMON release)
 # export LEMON_DIR=/path/to/lemon/share/lemon/cmake
 # (the variables are listed in the header of openroad/build_openroad.sh).
