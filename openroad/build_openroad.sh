@@ -9,8 +9,9 @@
 # 3. prints the path of the binary; set CTS3D_OPENROAD in setup_env.sh to it.
 #
 # Dependencies are the upstream OpenROAD dependencies (OR-Tools, spdlog, Boost, yaml-cpp, Tcl, SWIG, Bison, Flex, lemon,
-# CUDD; see the upstream DependencyInstaller).  This script sources setup_env.sh when it exists; for dependencies outside
-# the default search paths, set there (only as needed):
+# CUDD; see the upstream DependencyInstaller).  The dependency locations that the upstream installer records in
+# source_dir/etc/openroad_deps_prefixes.txt are passed to CMake.  This script sources setup_env.sh when it exists; for
+# dependencies outside the default search paths, set there (only as needed):
 #   CMAKE_PREFIX_PATH, CMAKE_C_COMPILER, CMAKE_CXX_COMPILER      install prefixes and compiler
 #   BISON_EXECUTABLE FLEX_EXECUTABLE FLEX_INCLUDE_DIR SWIG_EXECUTABLE LEMON_DIR LEMON_INCLUDE_DIR LEMON_LIBRARY
 #   CUDD_HEADER CUDD_LIB spdlog_DIR Boost_DIR TCL_LIBRARY TCL_HEADER   individual CMake locations
@@ -48,6 +49,9 @@ if [[ -d ${TCL_LIBRARY:-} ]]; then
   [[ -n ${TCL_HEADER:-} || ! -f $tcl_dir/../include/tcl.h ]] || TCL_HEADER=$(realpath "$tcl_dir/../include/tcl.h")
 fi
 cfg=(-DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=${BUILD_GUI:-ON} -DENABLE_TESTS=OFF)
+# package roots recorded by the upstream installer (-D <pkg>_ROOT=<dir> ...); setup_env.sh settings follow and take effect
+deps=$SRC/etc/openroad_deps_prefixes.txt
+if [[ -s $deps ]]; then read -r -d '' -a roots < "$deps" || true; cfg+=(${roots[@]+"${roots[@]}"}); echo "dependency locations: $deps"; fi
 if [[ -n ${CMAKE_PREFIX_PATH:-} ]]; then cfg+=(-DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"); fi
 for v in CMAKE_C_COMPILER CMAKE_CXX_COMPILER BISON_EXECUTABLE FLEX_EXECUTABLE FLEX_INCLUDE_DIR LEMON_DIR \
          LEMON_INCLUDE_DIR LEMON_LIBRARY SWIG_EXECUTABLE CUDD_HEADER CUDD_LIB spdlog_DIR Boost_DIR TCL_LIBRARY TCL_HEADER; do
