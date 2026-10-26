@@ -33,10 +33,10 @@ OpenROAD tree.
 
 ## Requirements
 
-Linux x86-64 with the dependencies of [OpenROAD](https://github.com/The-OpenROAD-Project/OpenROAD), which its
-`etc/DependencyInstaller.sh` installs. OpenROAD requires C++20. Use the OpenROAD-maintained LEMON fork
-([lemon-graph](https://github.com/The-OpenROAD-Project/lemon-graph), tag `1.3.1`) instead of the original LEMON 1.3.1
-release. The dependency installer may skip installation if the original version is already present.
+Linux x86-64 with the [OpenROAD](https://github.com/The-OpenROAD-Project/OpenROAD) dependencies (C++20), installed by
+its `etc/DependencyInstaller.sh`. LEMON must be the OpenROAD fork
+[lemon-graph](https://github.com/The-OpenROAD-Project/lemon-graph) 1.3.1; the installer skips LEMON when a 1.3.1
+release (fork or original) is already in its install prefix.
 
 | Tool / library | Tested version |
 |---|---|
